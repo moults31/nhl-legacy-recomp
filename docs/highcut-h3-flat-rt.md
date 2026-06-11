@@ -240,6 +240,30 @@ work (diff beta's untiled texture vs the base for `0x1AF09000`, find the address
 divergence, fix), not a one-line change — and it generalizes to all 3D scenes (gameplay
 included), so it is worth doing as a parity pass rather than per-scene.
 
+## Where the deep dive stands (log-based debugging exhausted → use the frame debugger)
+
+The misplacement is fully isolated to draw **#430** (player composite): correct full-frame
+viewport, samples a correct 1280×720 player RTT texture (`0x1AF09000`), yet renders the
+player shifted+wrapped while the base renders it correctly. The remaining unknown is which
+of these diverges from the base for this one draw:
+- the **texture untile/addressing** for a *resolved render-target* texture (in the
+  offscreen/flat path the RT cache isn't tracking `0x1AF09000` as a resolved surface, so
+  the texture cache may untile it as a plain 2D texture), or
+- the composite quad's **UVs / sampler address mode** (a U-offset past 1.0 with WRAP
+  reproduces the right-shift + left-sliver exactly).
+
+**Log-based debugging has hit its limit:** the generic per-draw vertex diag assumes
+`pos@0 float3` and reads ~0 for these 2D composite quads (different vertex/UV layout), so
+it can't show the quad's UVs. The efficient next step is the **frame debugger**:
+`NHL_BETA_RENDERDOC=1` brackets the takeover frame (StartFrameCapture→EndFrameCapture); open
+the `.rdc` and inspect draw #430's **bound SRV (is `0x1AF09000` untiled correctly?), its
+UVs, and the sampler address mode** vs the base. That directly shows the divergence in one
+look, where logs can't. Then fix in the untile path (track resolved-surface ownership in
+the flat path) or the sampler/UV. The fix generalizes to all 3D scenes (gameplay included).
+
+This is the documented deep Tier-1 parity core (build-order §4.1) and is multi-session
+renderer work — isolated precisely here, to resume with the frame debugger.
+
 ## Reproduce (the diagnostic runs above)
 
 ```
