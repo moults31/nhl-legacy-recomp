@@ -114,8 +114,31 @@ Tapped arg signatures (first calls; device = `r3=ADEC6A80`) + body reads:
 - **Swap/Present `sub_827F1C88`** args `(device, surface=BFC6D0C0, …, 0x500=1280, 0x2D0=720)` → present surface +
   size at the hook.
 
-**Verdict:** Resolve + the resource-binding verbs (incl. the SetRenderTarget-class surface bind) are **out-of-line
-and carry logical resource pointers**; only the **per-draw DRAW_INDX is inlined**.
+**Verdict:** Resolve + the resource-binding verbs are **out-of-line and carry logical resource pointers**; only
+the **per-draw DRAW_INDX is inlined**.
+
+### Double-check (per request): DRAW is inlined — CONFIRMED directly
+`sub_827FFEC8` is a **game** render function (recomp.32.cpp, 563 insns) that repeatedly **loads/stores the
+command-buffer current pointer at device offset 48** (`lwz r11,48(r31)` / `stw r10,48(r31)` …) — i.e. it writes
+GPU packets **inline** by advancing the ring pointer, interspersed with out-of-line resource binds and an
+out-of-line `Resolve` (`sub_827EF8E0`). So draws/state packets are emitted inline in game code; reserve-space
+(`sub_827EC318`) is the bulk reserve (1/frame), not per-draw. Combined with "no out-of-line fn at ~61/frame,"
+**the per-draw path is inlined** — re-confirmed by direct inspection, not just by absence.
+
+### SetRenderTarget — partly resolved, with a caveat (per request)
+`sub_827E6480` is an out-of-line surface bind: VMX-copies a 16-dword descriptor into device slot
+`(index+120)*16` and sets a dirty flag. Over 30 live calls it is **always `(index=0, surface=ADBC7B00)`** at
+~0.8/frame — a render-target-class bind (distinct from the present surface BFC6D0C0). But the captured boot is
+menu/attract-heavy and only ever exercises **one** render target, so this is consistent with **SetRenderTarget
+binding the single main RT** *and* with a fixed-resource bind — I could not force multi-RT variety on the live
+boot to disambiguate. So: **an out-of-line RT-surface bind exists, likely SetRenderTarget, not airtight.**
+
+**Why it barely matters for the hybrid either way:** the logical render-target **sizes/formats come from the
+out-of-line `CreateRenderTarget` (resource-creation) hooks** regardless. So even if the per-frame RT *bind* were
+partly inline, the residual EDRAM bookkeeping is just a small **EDRAM-base → logical-RT** map (a handful of RTs/
+frame), with logical sizes already known — not the full fold reconstruction. The fold still dies (flat RTs sized
+from CreateRenderTarget). Airtight SetRenderTarget identification would need a multi-RT live scene or the device
+vtable (flat-image RE) — deferred as non-blocking.
 
 ### Why this shrinks the hybrid's EDRAM cost a lot
 Because *where/what* (current RT, bound textures, resolve src→dest, present surface+size) all come from D3D9

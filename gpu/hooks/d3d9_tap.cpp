@@ -85,7 +85,7 @@ inline uint64_t Hit(int slot) {
     REX_HOOK_RAW(sym) {                                                       \
         if (g_enabled) {                                                      \
             uint64_t n = Hit(S_##sym);                                        \
-            if (n <= 2)                                                       \
+            if (n <= 30)                                                      \
                 REXLOG_INFO("[d3d9-tap] ARG {} r3={:08X} r4={:08X} r5={:08X} " \
                             "r6={:08X} r7={:08X}", #sym, ctx.r3.u32,          \
                             ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);  \
