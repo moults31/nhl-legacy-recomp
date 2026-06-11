@@ -67,6 +67,14 @@ Repair/reproduce: `pwsh tools/fetch_thirdparty.ps1`.
   regenerable/copyrighted artifacts gitignored).
 - **M0a/M0b: DONE** (licenses clean, plume fit confirmed).
 - **M0c vendoring: DONE** — plume + XenosRecomp fetched at the pins above.
-- **Next (M0c build):** wire CMake (`add_subdirectory(third_party/plume)`, new `gpu` target) and stand up a plume
-  cleared-window standalone on D3D12 + Vulkan. Then M1: pin the core D3D9 entry points via runtime correlation
-  and route the first hooked frame through plume.
+- **M0c plume standalone: DONE ✅** — `gpu/smoke/` (Win32 cleared-window, no SDL/recomp) builds plume as a
+  static lib and runs on **both backends**:
+  - `[plume-smoke] backend=D3D12 ... SMOKE OK: cleared+presented 60 frames on D3D12` (exit 0)
+  - `[plume-smoke] backend=Vulkan ... SMOKE OK: cleared+presented 60 frames on Vulkan` (exit 0)
+  - **Toolchain confirmed:** VS2022 BuildTools `vcvars64` + Ninja + **MSVC cl** (plume compiles clean with MSVC;
+    no clang needed for the engine). Build helper: `gpu/smoke/_build_smoke.bat`; isolated build dir
+    `out/highcut-smoke` (gitignored). plume built clean: `plume_d3d12.cpp`, `plume_vulkan.cpp`,
+    `D3D12MemAlloc.cpp` → `plume.lib` → `plume_smoke.exe`.
+- **Next (M1):** pin the core D3D9 entry points (from `docs/phase0-d3d9-entry-points.txt`) via runtime
+  correlation, hook them via `REX_HOOK`, and route the first hooked frame through plume (CreateDevice→plume
+  device, Present→plume present, Clear→plume clearColor).
