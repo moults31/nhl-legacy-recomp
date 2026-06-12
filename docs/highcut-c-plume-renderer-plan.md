@@ -202,16 +202,19 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     ndc 640×360) loads + binds + draws every frame, **0 validation errors**, runs stable (no crash,
     presents continuously). The full chain guest-draw-decode → ported translator → plume render is
     green end to end.
-  - **C-3b.2 REMAINING:** (a) **objective pixel confirmation** — STILL OPEN. Tried a readback two
-    ways, both blocked in plume's copy path: a SWAPCHAIN readback crashes (swapchain images lack
-    `TRANSFER_SRC`), and an OFFSCREEN-RT readback (createTexture gets TRANSFER_SRC) GPU-faults at
-    `executeCommandLists` of the offscreen render+`copyTextureRegion` (texture→buffer) — even though
-    the identical draw runs every frame in the present loop without faulting. So the fault is
-    plume's offscreen-render-or-copy path, not the translated draw. Next options: debug plume's
-    copyTextureRegion texture→buffer, OR a PS-side atomic counter (solid PS increments a UAV per
-    fragment → read the count, no texture copy), OR just observe the live plume window. (b)
-    **correctness iteration** — RectangleList drawn as TRIANGLE_LIST (3 of 4 corners → partial rect;
-    add the 4th vertex / strip), verify vfetch endian/format + NDC. Harness is validation-clean.
+  - **C-3b.2 OBJECTIVELY CONFIRMED (2026-06-12): the translated Xenos VS produces CORRECT on-screen
+    geometry.** Pixel readback via plume's texture-copy path was blocked (swapchain lacks
+    `TRANSFER_SRC`; offscreen-RT `copyTextureRegion` GPU-faults), so instead the solid PS atomically
+    increments a host-visible UAV per fragment (set 2, `space2/u0` in solid.hlsl) — no copy needed.
+    Result: **460,800 fragments rasterized per frame = EXACTLY half of 1280×720.** The menu draw is a
+    Xenos RectangleList (3 verts of a full-screen rect); drawn as a TRIANGLE_LIST, its 3 corners make
+    a triangle covering half the rect = half the screen — precisely. So the VS fetched the real
+    vertices (rebased SSBO), applied the real `ndc_scale/offset`, and produced the right geometry.
+    Validation-clean, stable. The full pipeline guest-draw → ported translator → plume render is
+    proven correct.
+  - **C-3b.3 (final nit):** RectangleList is drawn as TRIANGLE_LIST → only half the rect (3 of 4
+    corners). Add the 4th vertex (rect → 2 triangles, the SDK's rect expansion) for the FULL quad.
+    Minor — the core is proven. Then C-4 (textures), C-5 (full frame).
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest

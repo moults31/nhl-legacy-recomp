@@ -121,6 +121,10 @@ struct PlumeCtx {
     std::unique_ptr<RenderDescriptorSet> xlatSet0, xlatSet1;
     bool xlatDrawReady = false;
     uint32_t xlatVertexCount = 3;  // C-3b.2: real vertex count from the draw packet (else 3)
+    // C-3b.2 verify: host-visible UAV the solid PS atomically increments per fragment.
+    std::unique_ptr<RenderBuffer> xlatCounterBuf;
+    std::unique_ptr<RenderDescriptorSet> xlatSet2;
+    int xlatCounterReadsLeft = 4;  // read the count for the first few frames, then stop
     uint64_t frame = 0;
 };
 
@@ -325,13 +329,16 @@ void RenderClear(PlumeCtx& c) {
                     RenderDescriptorSetBuilder set0, set1;
                     RenderPipelineLayoutBuilder lb;
                     lb.begin(/*isLocal=*/false, /*allowInputLayout=*/false);
+                    RenderDescriptorSetBuilder set2;  // C-3b.2: PS fragment-counter UAV (space2/u0)
                     if (!emptyLayout) {
                         set0.begin(); set0.addByteAddressBuffer(0); set0.end();           // shared memory
                         set1.begin();                                                     // constants (gaps 1,2)
                         set1.addConstantBuffer(0); set1.addConstantBuffer(3); set1.addConstantBuffer(4);
                         set1.end();
+                        set2.begin(); set2.addReadWriteByteAddressBuffer(0); set2.end();  // frag counter
                         lb.addDescriptorSet(set0);  // -> set 0
                         lb.addDescriptorSet(set1);  // -> set 1
+                        lb.addDescriptorSet(set2);  // -> set 2
                     }
                     lb.end();
                     c.xlatLayout = lb.create(c.device.get());
@@ -376,17 +383,24 @@ void RenderClear(PlumeCtx& c) {
                                 RenderBufferDesc::UploadBuffer(kSharedSize, RenderBufferFlag::STORAGE));
                             if (c.xlatSharedBuf) { void* p = c.xlatSharedBuf->map(); std::memset(p, 0, kSharedSize); c.xlatSharedBuf->unmap(); }
 
-                            RenderDescriptorSetBuilder ds0, ds1;
+                            constexpr uint64_t kCounterSize = 256;
+                            c.xlatCounterBuf = c.device->createBuffer(RenderBufferDesc::UploadBuffer(
+                                kCounterSize, RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS));
+                            if (c.xlatCounterBuf) { void* p = c.xlatCounterBuf->map(); std::memset(p, 0, kCounterSize); c.xlatCounterBuf->unmap(); }
+                            RenderDescriptorSetBuilder ds0, ds1, ds2;
                             ds0.begin(); ds0.addByteAddressBuffer(0); ds0.end();
                             ds1.begin(); ds1.addConstantBuffer(0); ds1.addConstantBuffer(3); ds1.addConstantBuffer(4); ds1.end();
+                            ds2.begin(); ds2.addReadWriteByteAddressBuffer(0); ds2.end();
                             c.xlatSet0 = ds0.create(c.device.get());
                             c.xlatSet1 = ds1.create(c.device.get());
-                            if (c.xlatSet0 && c.xlatSet1 && c.xlatSysBuf && c.xlatBoolBuf &&
-                                c.xlatFetchBuf && c.xlatSharedBuf) {
+                            c.xlatSet2 = ds2.create(c.device.get());
+                            if (c.xlatSet0 && c.xlatSet1 && c.xlatSet2 && c.xlatSysBuf && c.xlatBoolBuf &&
+                                c.xlatFetchBuf && c.xlatSharedBuf && c.xlatCounterBuf) {
                                 c.xlatSet0->setBuffer(0, c.xlatSharedBuf.get(), kSharedSize);
                                 c.xlatSet1->setBuffer(0, c.xlatSysBuf.get(), kSysSize);
                                 c.xlatSet1->setBuffer(1, c.xlatBoolBuf.get(), kBoolSize);
                                 c.xlatSet1->setBuffer(2, c.xlatFetchBuf.get(), kFetchSize);
+                                c.xlatSet2->setBuffer(0, c.xlatCounterBuf.get(), kCounterSize);
                                 c.xlatDrawReady = true;
 
                                 // C-3b.2: load the decoded-draw packet and fill the buffers with
@@ -449,10 +463,17 @@ void RenderClear(PlumeCtx& c) {
     // bind+draw path so the validation layer can confirm the descriptor sets match the shader.
     // C-3b.2 fills the buffers with real decoded data -> actual geometry.
     if (c.xlatDrawReady) {
+        // C-3b.2 verify: zero the fragment counter before this frame's draw (GPU is idle here — the
+        // prior frame's fence was waited at the end of RenderClear), so the post-present read gives
+        // this frame's rasterized-pixel count.
+        if (c.xlatCounterReadsLeft > 0 && c.xlatCounterBuf) {
+            if (void* p = c.xlatCounterBuf->map()) { *static_cast<uint32_t*>(p) = 0; c.xlatCounterBuf->unmap(); }
+        }
         c.cmd->setGraphicsPipelineLayout(c.xlatLayout.get());
         c.cmd->setPipeline(c.xlatPipeline.get());
         c.cmd->setGraphicsDescriptorSet(c.xlatSet0.get(), 0);
         c.cmd->setGraphicsDescriptorSet(c.xlatSet1.get(), 1);
+        c.cmd->setGraphicsDescriptorSet(c.xlatSet2.get(), 2);
         c.cmd->drawInstanced(c.xlatVertexCount, 1, 0, 0);
     }
 
@@ -469,6 +490,19 @@ void RenderClear(PlumeCtx& c) {
     c.queue->executeCommandLists(&cl, 1, &wait, 1, &signal, 1, c.fence.get());
     c.swap->present(idx, &signal, 1);
     c.queue->waitForCommandFence(c.fence.get());
+
+    // C-3b.2 verify: the GPU is now idle (fence waited), so the PS's atomic writes to the host-
+    // visible counter are complete + visible. Read this frame's rasterized-pixel count.
+    if (c.xlatDrawReady && c.xlatCounterReadsLeft > 0 && c.xlatCounterBuf) {
+        --c.xlatCounterReadsLeft;
+        if (const void* p = c.xlatCounterBuf->map()) {
+            uint32_t frags = *static_cast<const uint32_t*>(p);
+            c.xlatCounterBuf->unmap();
+            REXLOG_INFO("[highcut-C3b2] translated-draw rasterized {} fragments this frame "
+                        "(>0 => the Xenos VS produced on-screen geometry; verts={})",
+                        frags, c.xlatVertexCount);
+        }
+    }
 }
 
 // Dedicated plume thread: owns the window + D3D12 device + swapchain and its message
