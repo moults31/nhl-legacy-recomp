@@ -202,11 +202,16 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     ndc 640×360) loads + binds + draws every frame, **0 validation errors**, runs stable (no crash,
     presents continuously). The full chain guest-draw-decode → ported translator → plume render is
     green end to end.
-  - **C-3b.2 REMAINING:** (a) **objective pixel confirmation** — a readback to count rendered pixels;
-    the swapchain lacks `TRANSFER_SRC`, so this needs an offscreen RT (render xlat → offscreen →
-    readback + blit to swapchain). (b) **correctness iteration** — RectangleList drawn as TRIANGLE_LIST
-    (3 of 4 corners → partial rect; add the 4th vertex / strip), and verify vfetch endianness/format
-    + NDC produce the right on-screen shape. The validation-clean harness is in place to iterate on.
+  - **C-3b.2 REMAINING:** (a) **objective pixel confirmation** — STILL OPEN. Tried a readback two
+    ways, both blocked in plume's copy path: a SWAPCHAIN readback crashes (swapchain images lack
+    `TRANSFER_SRC`), and an OFFSCREEN-RT readback (createTexture gets TRANSFER_SRC) GPU-faults at
+    `executeCommandLists` of the offscreen render+`copyTextureRegion` (texture→buffer) — even though
+    the identical draw runs every frame in the present loop without faulting. So the fault is
+    plume's offscreen-render-or-copy path, not the translated draw. Next options: debug plume's
+    copyTextureRegion texture→buffer, OR a PS-side atomic counter (solid PS increments a UAV per
+    fragment → read the count, no texture copy), OR just observe the live plume window. (b)
+    **correctness iteration** — RectangleList drawn as TRIANGLE_LIST (3 of 4 corners → partial rect;
+    add the 4th vertex / strip), verify vfetch endian/format + NDC. Harness is validation-clean.
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest
