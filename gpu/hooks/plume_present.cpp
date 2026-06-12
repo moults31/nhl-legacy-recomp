@@ -38,9 +38,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -100,12 +102,23 @@ struct PlumeCtx {
     std::unique_ptr<RenderBuffer> vbuf;
     RenderVertexBufferView vbView;
     RenderInputSlot inputSlot;
+    // C-2: shader module created from a translated Xenos VS (the shader bridge), once.
+    std::unique_ptr<RenderShader> xlatVS;
+    bool xlatDone = false;
     uint64_t frame = 0;
 };
 
 // Guest Present hook bumps this; the plume thread renders one frame per increment.
 std::atomic<uint64_t> g_guestFrames{0};
 std::atomic<bool> g_threadLaunched{false};
+
+// C-2 shader bridge: the CP thread (RenderBetaOwnedDraw / P-3) translates a real Xenos vertex
+// shader to SPIR-V and publishes the bytes here; the plume Vulkan thread picks them up and
+// creates a shader module from them — proving the translate->plume bridge end to end, and that
+// a real Vulkan driver accepts the ported translator's output. Mutex-guarded one-shot handoff.
+std::mutex g_xlatMutex;
+std::vector<uint8_t> g_xlatVS;
+bool g_xlatVSReady = false;
 // Don't touch D3D12 until the game is steadily presenting (past GPU init), or the
 // second device creation races rexglue's init and resets its device.
 constexpr uint64_t kInitAfterGuestFrames = 30;
@@ -243,6 +256,43 @@ void RenderClear(PlumeCtx& c) {
     const float t = (c.frame % 120) / 120.0f;
     c.cmd->clearColor(0, RenderColor(0.1f, t, 0.2f + 0.3f * t, 1.0f));
 
+    // C-2: if the CP thread published a translated Xenos VS, create a plume shader module from
+    // it (once). createShader runs the SPIR-V through vkCreateShaderModule on a real Vulkan
+    // driver — the shader bridge proof. SPIRV backend only (the translator emits SPIR-V).
+    if (!c.xlatDone) {
+        std::vector<uint8_t> spv;
+        {
+            std::lock_guard<std::mutex> lk(g_xlatMutex);
+            if (g_xlatVSReady) { spv.swap(g_xlatVS); g_xlatVSReady = false; }
+        }
+        // Fallback: load the P-3 dump from cwd. Lets C-2 run present-only (no beta takeover,
+        // which fires the translation during early boot before plume is up) after a P-3 run.
+        if (spv.empty()) {
+            if (FILE* f = std::fopen("highcut_p3_vs.spv", "rb")) {
+                std::fseek(f, 0, SEEK_END);
+                long sz = std::ftell(f);
+                std::fseek(f, 0, SEEK_SET);
+                if (sz > 0) { spv.resize(size_t(sz)); if (std::fread(spv.data(), 1, size_t(sz), f) != size_t(sz)) spv.clear(); }
+                std::fclose(f);
+                if (!spv.empty()) REXLOG_INFO("[highcut-C2] loaded {} bytes from highcut_p3_vs.spv (disk fallback)", uint32_t(spv.size()));
+            }
+        }
+        if (!spv.empty()) {
+            c.xlatDone = true;
+            const RenderShaderFormat fmt = c.ri->getCapabilities().shaderFormat;
+            if (fmt == RenderShaderFormat::SPIRV) {
+                uint32_t magic = spv.size() >= 4 ? *reinterpret_cast<const uint32_t*>(spv.data()) : 0u;
+                c.xlatVS = c.device->createShader(spv.data(), spv.size(), "main", fmt);
+                REXLOG_INFO("[highcut-C2] translated Xenos VS -> plume shader module: {} "
+                            "({} bytes, magic=0x{:08X}). Any vkCreateShaderModule error would be on stderr.",
+                            c.xlatVS ? "module object created" : "null", uint32_t(spv.size()), magic);
+            } else {
+                REXLOG_INFO("[highcut-C2] translated VS available but plume backend is not SPIRV "
+                            "(fmt={}) — skipping (d3d12 cannot consume SPIR-V)", int(fmt));
+            }
+        }
+    }
+
     // C-1: draw the bring-up triangle over the clear — proves plume rasterizes real geometry
     // (vertex buffer + pipeline + draw), not just clears. The vertex-colored triangle is the
     // readable signal that the plume render path is live before we feed it decoded guest draws.
@@ -312,4 +362,14 @@ extern "C" void HighcutPlumeTick() {
     bool expected = false;
     if (g_threadLaunched.compare_exchange_strong(expected, true))
         std::thread(PlumeThreadMain).detach();
+}
+
+// C-2: called from the CP thread (RenderBetaOwnedDraw / P-3) to hand the just-translated Xenos
+// vertex shader's SPIR-V to the plume Vulkan thread, which creates a shader module from it. A
+// no-op-ish copy if the plume thread isn't running (nobody consumes it). Thread-safe.
+extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size) {
+    if (!data || size == 0) return;
+    std::lock_guard<std::mutex> lk(g_xlatMutex);
+    g_xlatVS.assign(data, data + size);
+    g_xlatVSReady = true;
 }

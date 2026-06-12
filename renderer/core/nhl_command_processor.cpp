@@ -1314,6 +1314,10 @@ void NhlD3D12CommandProcessor::BetaFlatResolve() {
                 beta_resolves_seen_++, dest, ri.copy_dest_extent_start);
 }
 
+// Defined in gpu/hooks/plume_present.cpp — C-2 shader bridge: hand a translated Xenos VS's
+// SPIR-V to the plume Vulkan thread for shader-module creation (no-op unless NHL_HIGHCUT_PRESENT).
+extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size);
+
 void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     xenos::PrimitiveType primitive_type, uint32_t index_count,
     rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info) {
@@ -1579,6 +1583,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         REXLOG_INFO("[highcut-P3] wrote {} bytes to highcut_p3_vs.spv (cwd) for spirv-val",
                     p3_bin.size());
       }
+      // C-2: hand the SPIR-V to the plume Vulkan thread, which creates a shader module from it
+      // (the translate->plume shader bridge). No-op unless NHL_HIGHCUT_PRESENT runs the plume
+      // thread; the bytes are just dropped otherwise.
+      HighcutPublishTranslatedVS(p3_bin.data(), p3_bin.size());
     }
   }
 

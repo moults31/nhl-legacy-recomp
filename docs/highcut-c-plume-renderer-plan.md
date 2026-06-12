@@ -128,8 +128,19 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
   `drawInstanced`, into the swapchain. Template = `third_party/plume/examples/triangle/main.cpp`.
   Proves the plume geometry + SPIR-V + pipeline path works in the required Vulkan/in-process setup.
   *Done = a triangle in the plume window, synced to guest Present.* **(START HERE.)**
-- **C-2 — Xenos ucode → SPIR-V → plume.** Drive `SpirvShaderTranslator` on one real guest shader
-  and render a triangle with the translated SPIR-V (hardcoded geometry). Proves the shader bridge.
+- **C-2 — Xenos ucode → SPIR-V → plume. DONE (2026-06-11): shader bridge proven.** The P-3
+  translated Xenos VS SPIR-V is handed to the plume Vulkan thread (in-memory
+  `HighcutPublishTranslatedVS` from the CP thread, plus a `highcut_p3_vs.spv` disk fallback so
+  C-2 runs present-only without beta takeover), which calls `createShader` →
+  **`vkCreateShaderModule` returned `VK_SUCCESS`** on a real Vulkan driver, no validation/VUID
+  errors on stderr. So plume-Vulkan accepts the ported translator's output as a shader module.
+  Run: `NHL_HIGHCUT_PRESENT=1` (present-only; the disk fallback loads the prior P-3 dump). NOTE:
+  beta-takeover + present same-run doesn't co-run cleanly yet — beta fires the owned draw during
+  early boot before plume's 30-frame init, so the in-memory same-run path is wired but unproven;
+  the disk path is the reliable demonstrator. Caveat: VK_LAYER_KHRONOS_validation is not installed
+  (no Vulkan SDK), so this is driver-acceptance, not full validation-layer spirv-val.
+  The remaining "render a triangle" part (pipeline + draw) needs the VS's descriptor/binding
+  environment (system-constants UBO, shared-memory SSBO for vertex fetch) → that is **C-3**.
 - **C-3 — one real decoded guest draw.** Bridge from the CP decode: take a 2D menu draw's
   vertex/index/constants/viewport (the data the beta CP already decodes in `RenderBetaOwnedDraw`),
   upload to plume, build a pipeline from its translated SPIR-V, draw it flat. Solid-color first
