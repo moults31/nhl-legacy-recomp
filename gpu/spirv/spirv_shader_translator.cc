@@ -247,6 +247,11 @@ void SpirvShaderTranslator::StartTranslation() {
       type_float4_, builder_->makeUintConstant(4), sizeof(float) * 4);
   builder_->addDecoration(type_float4_array_4, spv::DecorationArrayStride,
                           sizeof(float) * 4);
+  // P-2b/C-3: user_clip_planes is float[6][4] = 6 vec4s (kVersion-12 member).
+  spv::Id type_float4_array_6 = builder_->makeArrayType(
+      type_float4_, builder_->makeUintConstant(6), sizeof(float) * 4);
+  builder_->addDecoration(type_float4_array_6, spv::DecorationArrayStride,
+                          sizeof(float) * 4);
   spv::Id type_uint4_array_2 = builder_->makeArrayType(
       type_uint4_, builder_->makeUintConstant(2), sizeof(uint32_t) * 4);
   builder_->addDecoration(type_uint4_array_2, spv::DecorationArrayStride,
@@ -255,14 +260,35 @@ void SpirvShaderTranslator::StartTranslation() {
       type_uint4_, builder_->makeUintConstant(4), sizeof(uint32_t) * 4);
   builder_->addDecoration(type_uint4_array_4, spv::DecorationArrayStride,
                           sizeof(uint32_t) * 4);
+  // P-2b/C-3 FIX: this array MUST match the SDK header's SystemConstantIndex enum
+  // ORDER (kVersion-12) — the translator accesses members by that enum (e.g.
+  // kSystemConstantVertexBaseIndex). The upstream Xenia 95a5c3e body (kVersion-6) omitted
+  // the members the SDK later inserted (line_loop_closing_index, vertex_index_reset,
+  // compute_memexport_vertex_count, user_clip_planes, vertex_index_min/max,
+  // textures_resolution_scaled, alpha_to_mask), which shifted every later member and made
+  // the SPIR-V struct disagree with the access enum (spirv-val: int+v3float OpIAdd). Members
+  // are listed in enum order; offsetof gives each its std140 byte offset, so the SPIR-V
+  // layout matches the C struct regardless of enum-vs-memory order differences.
   const SystemConstant system_constants[] = {
       {"flags", offsetof(SystemConstants, flags), type_uint_},
       {"vertex_index_load_address",
        offsetof(SystemConstants, vertex_index_load_address), type_uint_},
       {"vertex_index_endian", offsetof(SystemConstants, vertex_index_endian),
        type_uint_},
+      {"line_loop_closing_index",
+       offsetof(SystemConstants, line_loop_closing_index), type_uint_},
       {"vertex_base_index", offsetof(SystemConstants, vertex_base_index),
        type_int_},
+      {"vertex_index_reset", offsetof(SystemConstants, vertex_index_reset),
+       type_uint_},
+      {"compute_memexport_vertex_count",
+       offsetof(SystemConstants, compute_memexport_vertex_count), type_uint_},
+      {"user_clip_planes", offsetof(SystemConstants, user_clip_planes),
+       type_float4_array_6},
+      {"vertex_index_min", offsetof(SystemConstants, vertex_index_min),
+       type_uint_},
+      {"vertex_index_max", offsetof(SystemConstants, vertex_index_max),
+       type_uint_},
       {"ndc_scale", offsetof(SystemConstants, ndc_scale), type_float3_},
       {"point_vertex_diameter_min",
        offsetof(SystemConstants, point_vertex_diameter_min), type_float_},
@@ -274,12 +300,15 @@ void SpirvShaderTranslator::StartTranslation() {
       {"point_screen_diameter_to_ndc_radius",
        offsetof(SystemConstants, point_screen_diameter_to_ndc_radius),
        type_float2_},
+      {"textures_resolution_scaled",
+       offsetof(SystemConstants, textures_resolution_scaled), type_uint_},
       {"texture_swizzled_signs",
        offsetof(SystemConstants, texture_swizzled_signs), type_uint4_array_2},
       {"texture_swizzles", offsetof(SystemConstants, texture_swizzles),
        type_uint4_array_4},
       {"alpha_test_reference", offsetof(SystemConstants, alpha_test_reference),
        type_float_},
+      {"alpha_to_mask", offsetof(SystemConstants, alpha_to_mask), type_uint_},
       {"edram_32bpp_tile_pitch_dwords_scaled",
        offsetof(SystemConstants, edram_32bpp_tile_pitch_dwords_scaled),
        type_uint_},

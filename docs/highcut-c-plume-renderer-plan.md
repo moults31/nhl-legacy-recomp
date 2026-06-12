@@ -114,10 +114,16 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     passes the stateful base/indexChain so it is unaffected). Kept glslang at 14.3.0 (re-pinning
     to Xenia's submodule SHA would have reverted the P-2b `makeFunctionEntry` fix and risked the
     SDK header / toolchain compat P-1 validated).
-  - **NOT YET: full `spirv-val`.** No SPIRV-Tools/`spirv-val` is available in the tree (glslang
-    `ENABLE_OPT=off`). Achieved bar = magic + structural well-formedness + translator `is_valid`.
-    Full semantic `spirv-val` (build SPIRV-Tools) OR the real test at **C-2** (feed to plume-Vulkan
-    `createShader` + validation layers) is the next validation step.
+  - **`spirv-val`-CLEAN (2026-06-12).** With the Vulkan SDK installed (`C:\VulkanSDK\1.4.350.0`),
+    `spirv-val` initially caught a REAL bug the structural check missed: `OpIAdd %int %int %v3float`
+    (int + ndc_scale). Root cause = the P-2b kVersion mismatch — the `.cc`'s system-constants build
+    array was the upstream kVersion-6 member set, but the translator accesses members via the SDK
+    header's kVersion-12 `SystemConstantIndex` enum, so every constant past index 2 was off (this
+    was also the C-3 driver crash). Fixed by rebuilding the `.cc` array to the full kVersion-12
+    member set (added line_loop_closing_index, vertex_index_reset, compute_memexport_vertex_count,
+    user_clip_planes, vertex_index_min/max, textures_resolution_scaled, alpha_to_mask). Now
+    **`spirv-val` exits 0** on the 6644-byte module. (This is the kind of latent kVersion-6-body bug
+    the P-2b notes warned about; other shaders may surface more — spirv-val each one.)
 - **C-2/C-3 (next)** — feed the P-3 SPIR-V to plume-Vulkan `createShader` + build a pipeline,
   rejoining the C milestones below.
 
@@ -158,17 +164,17 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     `denorm_flush_to_zero` / `rounding_mode_rte` **disabled** (`Features(true)` had enabled them).
     plume's device doesn't enable `VK_KHR_shader_float_controls`, and those execution modes made
     the driver crash. The VS SPIR-V is now vanilla (capabilities = `[Shader]` only, 6144 bytes).
-  - **BLOCKER:** `vkCreateGraphicsPipelines` still **crashes the driver** (no `VkResult` error, no
-    stderr) compiling the translated VS — with BOTH the correct full layout and an empty layout.
-    The module itself is accepted by `vkCreateShaderModule` (C-2) and is structurally well-formed.
-    Diagnosing needs validation output, which is currently unreachable: no `spirv-val`/Vulkan SDK;
-    Steam bundles `VkLayer_khronos_validation.dll` but plume creates no `VkDebugUtilsMessenger`, so
-    the layer's messages go to `OutputDebugString` (uncaptured), not stderr. **Next: add a debug
-    messenger to plume's Vulkan device (reproducible patch) to route validation -> REXLOG, OR
-    install the Vulkan SDK** — then the exact pipeline-creation error is visible and fixable.
-  - C-3b (after the pipeline creates): populate the descriptor buffers from the beta CP's decoded
-    data (system constants NDC transform, fetch-constant vfetch descriptor, shared-memory SSBO
-    vertex bytes) and `drawInstanced` — the actual rendered geometry.
+  - **C-3a pipeline now CREATES (2026-06-12).** The driver crash was the invalid `OpIAdd` above
+    (the kVersion system-constants mismatch), NOT the layout or float-controls. After the
+    `spirv-val` fix, `createGraphicsPipeline` from the translated VS + solid PS + the reflected
+    layout **succeeds** (`[highcut-C3a] graphics pipeline ... CREATED`, no stderr). So the full
+    chain translate -> SPIR-V -> plume module -> plume **pipeline** works on a real Vulkan driver.
+    (Float-controls stay disabled — never re-tested with them on; the real crash was the IAdd, so
+    they can likely be re-enabled once plume's device advertises `VK_KHR_shader_float_controls`.)
+  - C-3b (NEXT — the actual draw): populate the descriptor buffers from the beta CP's decoded data
+    (system constants NDC transform/vertex_base_index, fetch-constant vfetch descriptor, shared-
+    memory SSBO vertex bytes) and `drawInstanced`. The system-constants struct now matches the C
+    `SystemConstants` layout (offsetof-decorated), so the host side can upload it directly.
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest
