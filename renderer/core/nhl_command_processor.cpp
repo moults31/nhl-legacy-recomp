@@ -4183,7 +4183,11 @@ void __stdcall BetaD3D12MessageCallback(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SE
 }
 }  // namespace
 
+// Defined in gpu/hooks/highcut_spirv_probe.cpp — P-1 glslang link/compile probe (self-gated).
+extern "C" void HighcutSpirvProbe();
+
 bool NhlD3D12CommandProcessor::SetupContext() {
+  HighcutSpirvProbe();  // P-1: prove glslang builds/links (no-op unless NHL_HIGHCUT_SPIRV_PROBE)
   // Default (alpha) path: forward to the base D3D12 backend unchanged. This builds
   // the base's own caches and the device/provider our beta caches will reference.
   const bool ok = d3d12::D3D12CommandProcessor::SetupContext();

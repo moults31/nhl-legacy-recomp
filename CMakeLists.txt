@@ -25,6 +25,8 @@ set(NHLLEGACY_SOURCES
     # High-cut engine (H-2): first plume-driven frame — an in-process plume D3D12
     # swapchain driven by the guest Present hook. Env-gated (NHL_HIGHCUT_PRESENT).
     gpu/hooks/plume_present.cpp
+    # High-cut path C (P-1): glslang link/compile probe for the SPIR-V translator port.
+    gpu/hooks/highcut_spirv_probe.cpp
     # Loose-file overlay: union-mount _compiled over the cache: scratch dir,
     # with per-file .dds -> .rx2 texture synthesis in the lower tree.
     src/union_device.cpp
@@ -70,6 +72,27 @@ plume_compile_vertex_shader(nhllegacy
     "${CMAKE_CURRENT_SOURCE_DIR}/gpu/hooks/shaders/triangle.hlsl" triangleVert VSMain)
 plume_compile_pixel_shader(nhllegacy
     "${CMAKE_CURRENT_SOURCE_DIR}/gpu/hooks/shaders/triangle.hlsl" triangleFrag PSMain)
+
+# High-cut path C (P-1): vendor glslang for the Xenos->SPIR-V translator PORT. The SDK's
+# spirv_builder.h / spirv_translator.h ARE Xenia's (they extend glslang's spv::Builder) but the
+# implementation is not shipped, so P-2 ports Xenia's translator + spirv_builder .cc, which need
+# glslang's SPIRV backend. P-1 proves glslang builds+links in this clang/MSVC env and that the
+# SDK header compiles against it. Build only what we need (no GLSL binaries/tests/optimizer).
+include(FetchContent)
+set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(ENABLE_OPT OFF CACHE BOOL "" FORCE)        # skip the SPIRV-Tools optimizer dependency for now
+set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(glslang
+    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+    GIT_TAG 14.3.0)
+FetchContent_MakeAvailable(glslang)
+# The SPIRV target provides spv::Builder (glslang's SPIR-V backend). Adding the glslang source
+# root to the include path makes the SDK's `#include <SPIRV/SpvBuilder.h>` resolve.
+target_link_libraries(nhllegacy PRIVATE SPIRV)
+target_include_directories(nhllegacy PRIVATE "${glslang_SOURCE_DIR}")
 
 # snappy (for .xtr trace decompression in the in-host replay mode). Statically
 # linked into rexruntime.dll but not re-exported, so link it directly; lib name

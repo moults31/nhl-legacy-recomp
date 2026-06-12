@@ -26,12 +26,23 @@ render into **flat host RTs at logical size**.
 1. **Backend = plume Vulkan.** A 2nd D3D12 device in-process TDRs rexglue ([[highcut-h2-plume-present]]);
    plume Vulkan coexists. (plume D3D12 only becomes viable once rexglue's GPU is fully off — a
    late "takeover" milestone, deferred.)
-2. **Shaders = SPIR-V via the SDK.** plume's shader formats are DXIL/SPIRV/METAL (not DXBC). The
-   SDK ships `rex/graphics/pipeline/shader/spirv_translator.h` (`SpirvShaderTranslator`, Xenia's
-   Vulkan path) + a full `rex/graphics/vulkan/` backend. So Xenos ucode → `SpirvShaderTranslator::
-   CompleteTranslation()` → SPIR-V bytes → `device->createShader(..., RenderShaderFormat::SPIRV)`.
-   **No DXBC→SPIRV cross-compile.** (The beta CP currently uses the DXBC translator; the plume
-   path uses the SPIR-V one instead.)
+2. ~~**Shaders = SPIR-V via the SDK.**~~ **DEAD (2026-06-11):** the SDK's `win-amd64` build is
+   **D3D12-only** — it ships the `spirv_translator.h` *header* but the implementation is NOT in
+   `rexruntime.lib` (`llvm-nm`: **0 `SpirvShaderTranslator` symbols**), and the header transitively
+   needs glslang's `SPIRV/SpvBuilder.h` which isn't shipped either. So Xenos→SPIR-V via the SDK is
+   not linkable. **REVISED — shaders = DXBC, backend = plume D3D12 sharing rexglue's device:**
+   - Use the SDK's **DXBC** translator (already working in the beta path, exported) → DXBC bytes.
+   - plume's D3D12 `createShader` only `assert`s the format *label* == DXIL but copies the raw
+     bytecode into the PSO; the **D3D12 runtime accepts DXBC** containers → label DXBC as `DXIL`
+     and it works. **No SPIR-V, no DXIL conversion, no glslang.**
+   - The 2nd-D3D12-device TDR ([[highcut-h2-plume-present]]) is avoided by **patching vendored
+     plume `D3D12Device` to ADOPT rexglue's existing `ID3D12Device`** (one device, multiple queues
+     — standard D3D12) instead of creating its own. plume is vendored source, so this is fair game.
+   - **RISK (must validate first):** sharing rexglue's *live, actively-submitting* device is a
+     hypothesis (only the 2nd-*device* TDR was proven; one-device-multi-queue should be fine but
+     isn't yet shown here). C's revised first step is a triangle on the adopted device.
+   - Consequence: C is all-**D3D12** (present too can move off the H-2 Vulkan path once the device
+     is shared), and the H-2 plume-Vulkan present becomes a fallback, not the C render path.
 3. **Resources are ours.** Read guest RAM directly, upload to plume buffers (vertex/index/constant)
    — no shared-memory/write-watch/upload-ring machinery. Textures need an **untile** (Xenos tiled →
    linear) into a plume texture; do CPU untile first (simple), GPU-compute untile later (fast).
@@ -39,6 +50,35 @@ render into **flat host RTs at logical size**.
    actual), never EDRAM pitch. Guest Resolve → host copy plume-RT → plume-texture. The fold cannot
    occur because EDRAM never exists here.
 5. **Present = plume swapchain** (H-2 already drives it per guest Present).
+
+## Shader path DECISION (2026-06-11, user): port a Xenos→SPIR-V translator (keep plume Vulkan)
+
+Chosen over the shared-device D3D12+DXBC path to keep the render path fully decoupled from
+rexglue's live device (no shared-device risk). What the port concretely requires:
+
+- The SDK's `spirv_translator.h` IS Xenia's `spirv_shader_translator.h` (© Ben Vanik 2022, adapted
+  to `rex::` by Tom Clay 2026), but the **implementation is not shipped**. So vendor the matching
+  **Xenia `spirv_shader_translator*.cc`** (Xenia splits it across ~6–8 files: base + `_alu` +
+  `_fetch` + `_rb` + `_memexport` + …), adapted to the `rex::` namespace and the SDK's
+  `Shader`/`ShaderTranslator`/`Translation` types.
+- **Dependency: glslang** — Xenia's translator emits via glslang's `SPIRV/SpvBuilder.h`. Vendor
+  glslang (FetchContent) + its sub-deps (SPIRV-Tools, SPIRV-Headers) for the optimize/validate pass.
+- **Risk: header drift.** Must find the Xenia commit whose `spirv_shader_translator.h` matches the
+  SDK header, take its `.cc`, and reconcile any `rex::`-adaptation differences. The base
+  `ShaderTranslator::TranslateAnalyzedShader` IS exported (so the analyzed-Shader plumbing is
+  reusable); only the SPIR-V subclass impl is missing.
+- **Effort: large / multi-session**, and it requires authorizing the vendoring of two substantial
+  external codebases (glslang + Xenia translator source). The shared-device D3D12 alternative was a
+  ~one-function plume patch reusing the already-working DXBC translator; kept as a fallback if the
+  port's cost/risk proves prohibitive (the device-share hypothesis is cheaply testable in isolation).
+
+Port milestones: **P-1 DONE (2026-06-11)** — glslang 14.3.0 vendored (FetchContent, ENABLE_OPT/HLSL
+off), builds+links in the clang/MSVC toolchain, `spv::Builder` emits valid SPIR-V (magic 0x07230203),
+and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (probe:
+`gpu/hooks/highcut_spirv_probe.cpp`, gate `NHL_HIGHCUT_SPIRV_PROBE`). Original P-1 plan:
+**P-2** vendor+adapt the Xenia SPIR-V translator `.cc`, link against the SDK header, translate one
+analyzed `beta_current_vs_` → valid SPIR-V (byte-validate with spirv-val); **P-3** feed that SPIR-V
+to plume-Vulkan `createShader` + build a pipeline; then rejoin the C milestones below at C-3.
 
 ## Milestones (incremental, each independently testable)
 
