@@ -113,6 +113,12 @@ struct PlumeCtx {
     std::unique_ptr<RenderShader> xlatPS;
     std::unique_ptr<RenderPipelineLayout> xlatLayout;
     std::unique_ptr<RenderPipeline> xlatPipeline;
+    // C-3b: the VS's descriptor buffers + sets (set0 shared-memory SSBO; set1 system/bool/fetch
+    // UBOs) so the translated VS can be drawn. C-3b.1 zero-fills them (proves bind+draw mechanics
+    // validation-clean); C-3b.2 fills real decoded data.
+    std::unique_ptr<RenderBuffer> xlatSysBuf, xlatBoolBuf, xlatFetchBuf, xlatSharedBuf;
+    std::unique_ptr<RenderDescriptorSet> xlatSet0, xlatSet1;
+    bool xlatDrawReady = false;
     uint64_t frame = 0;
 };
 
@@ -346,6 +352,45 @@ void RenderClear(PlumeCtx& c) {
                                     "— any pipeline/driver error is on stderr.",
                                     emptyLayout ? "empty" : "set0=SSBO@0,set1=CBV@0,3,4",
                                     c.xlatPipeline ? "CREATED" : "FAILED (null)");
+
+                        // C-3b.1: create + bind the VS's descriptor buffers so it can be drawn.
+                        // Zero-filled for now (proves the bind+draw path is validation-clean before
+                        // real decoded data goes in at C-3b.2). Sizes: system constants UBO (>= the
+                        // std140 SystemConstants struct), bool/loop UBO (10 uvec4), fetch UBO (48
+                        // uvec4 = 32 fetch constants x 6 dwords), shared-memory SSBO (scratch).
+                        if (c.xlatPipeline && !emptyLayout) {
+                            auto mkUbo = [&](uint64_t sz) {
+                                auto b = c.device->createBuffer(
+                                    RenderBufferDesc::UploadBuffer(sz, RenderBufferFlag::CONSTANT));
+                                if (b) { void* p = b->map(); std::memset(p, 0, sz); b->unmap(); }
+                                return b;
+                            };
+                            constexpr uint64_t kSysSize = 2048, kBoolSize = 256, kFetchSize = 768,
+                                               kSharedSize = 1u << 16;
+                            c.xlatSysBuf = mkUbo(kSysSize);
+                            c.xlatBoolBuf = mkUbo(kBoolSize);
+                            c.xlatFetchBuf = mkUbo(kFetchSize);
+                            c.xlatSharedBuf = c.device->createBuffer(
+                                RenderBufferDesc::UploadBuffer(kSharedSize, RenderBufferFlag::STORAGE));
+                            if (c.xlatSharedBuf) { void* p = c.xlatSharedBuf->map(); std::memset(p, 0, kSharedSize); c.xlatSharedBuf->unmap(); }
+
+                            RenderDescriptorSetBuilder ds0, ds1;
+                            ds0.begin(); ds0.addByteAddressBuffer(0); ds0.end();
+                            ds1.begin(); ds1.addConstantBuffer(0); ds1.addConstantBuffer(3); ds1.addConstantBuffer(4); ds1.end();
+                            c.xlatSet0 = ds0.create(c.device.get());
+                            c.xlatSet1 = ds1.create(c.device.get());
+                            if (c.xlatSet0 && c.xlatSet1 && c.xlatSysBuf && c.xlatBoolBuf &&
+                                c.xlatFetchBuf && c.xlatSharedBuf) {
+                                c.xlatSet0->setBuffer(0, c.xlatSharedBuf.get(), kSharedSize);
+                                c.xlatSet1->setBuffer(0, c.xlatSysBuf.get(), kSysSize);
+                                c.xlatSet1->setBuffer(1, c.xlatBoolBuf.get(), kBoolSize);
+                                c.xlatSet1->setBuffer(2, c.xlatFetchBuf.get(), kFetchSize);
+                                c.xlatDrawReady = true;
+                                REXLOG_INFO("[highcut-C3b] descriptor buffers + sets created (zeroed) — draw enabled");
+                            } else {
+                                REXLOG_ERROR("[highcut-C3b] descriptor buffer/set creation failed");
+                            }
+                        }
                     } else {
                         REXLOG_ERROR("[highcut-C3a] pipeline layout or solid PS creation failed");
                     }
@@ -364,6 +409,18 @@ void RenderClear(PlumeCtx& c) {
         c.cmd->setGraphicsPipelineLayout(c.pipelineLayout.get());
         c.cmd->setPipeline(c.pipeline.get());
         c.cmd->setVertexBuffers(0, &c.vbView, 1, &c.inputSlot);
+        c.cmd->drawInstanced(3, 1, 0, 0);
+    }
+
+    // C-3b.1: draw the TRANSLATED Xenos VS pipeline with its descriptor sets bound. With zeroed
+    // buffers this renders nothing visible (degenerate positions), but it exercises the full
+    // bind+draw path so the validation layer can confirm the descriptor sets match the shader.
+    // C-3b.2 fills the buffers with real decoded data -> actual geometry.
+    if (c.xlatDrawReady) {
+        c.cmd->setGraphicsPipelineLayout(c.xlatLayout.get());
+        c.cmd->setPipeline(c.xlatPipeline.get());
+        c.cmd->setGraphicsDescriptorSet(c.xlatSet0.get(), 0);
+        c.cmd->setGraphicsDescriptorSet(c.xlatSet1.get(), 1);
         c.cmd->drawInstanced(3, 1, 0, 0);
     }
 

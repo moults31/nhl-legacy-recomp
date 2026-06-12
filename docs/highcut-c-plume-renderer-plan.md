@@ -171,10 +171,20 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     chain translate -> SPIR-V -> plume module -> plume **pipeline** works on a real Vulkan driver.
     (Float-controls stay disabled — never re-tested with them on; the real crash was the IAdd, so
     they can likely be re-enabled once plume's device advertises `VK_KHR_shader_float_controls`.)
-  - C-3b (NEXT — the actual draw): populate the descriptor buffers from the beta CP's decoded data
-    (system constants NDC transform/vertex_base_index, fetch-constant vfetch descriptor, shared-
-    memory SSBO vertex bytes) and `drawInstanced`. The system-constants struct now matches the C
-    `SystemConstants` layout (offsetof-decorated), so the host side can upload it directly.
+  - **C-3b.1 DONE (2026-06-12): bind + draw infrastructure, VALIDATION-CLEAN.** plume_present.cpp
+    (gated `NHL_HIGHCUT_C3`) now creates the VS's 4 descriptor buffers (system/bool/fetch UBOs +
+    shared-memory SSBO via `RenderBufferDesc::UploadBuffer` CONSTANT/STORAGE), creates the 2
+    descriptor sets, `setBuffer`s them, and `drawInstanced(3)` with both sets bound. Verified with
+    the Vulkan SDK validation layer (`VK_LAYER_KHRONOS_validation` active on plume's instance, via
+    `vk_layer_settings.txt` logging): **0 errors/VUID** — the descriptor sets match the shader and
+    the draw is valid. Buffers are zero-filled here, so nothing visible renders (degenerate
+    positions); this proves the bind+draw mechanics before real data.
+  - **C-3b.2 (NEXT — the actual geometry):** populate the buffers from the beta CP's decoded data —
+    system constants (NDC scale/offset, vertex_base_index; memcpy the now-layout-correct
+    `SystemConstants`), the 32 fetch constants (192 dwords from the register file), and the
+    shared-memory SSBO with the guest vertex bytes (rebased so the vfetch base offset indexes into
+    our SSBO). Bridge via a disk dump from `RenderBetaOwnedDraw` (like the `.spv`), since beta-
+    takeover + present don't co-run. Then the translated VS fetches + transforms real vertices.
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest
