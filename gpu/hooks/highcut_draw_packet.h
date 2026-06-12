@@ -19,11 +19,15 @@ namespace nhl::highcut {
 constexpr uint32_t kDrawPacketMagic = 0x48334450;  // 'H3DP'
 constexpr uint32_t kDrawPacketVersion = 1;
 
+// Plume topology for the host draw (the translated VS's expected primitive). Xenos RectangleList
+// is translated as kRectangleListAsTriangleStrip and drawn as a 4-vertex TRIANGLE_STRIP.
+enum DrawTopology : uint32_t { kTopoTriangleList = 0, kTopoTriangleStrip = 1 };
+
 struct DrawPacketHeader {
     uint32_t magic;          // kDrawPacketMagic
     uint32_t version;        // kDrawPacketVersion
-    uint32_t vertex_count;   // vertices to draw (drawInstanced count)
-    uint32_t prim_type;      // xenos::PrimitiveType (raw) — mapped to plume topology
+    uint32_t vertex_count;   // host vertices to draw (drawInstanced count)
+    uint32_t topology;       // DrawTopology — the plume primitive topology
     uint32_t fetch_bytes;    // size of the fetch-constants blob (192 dwords = 768)
     uint32_t sys_bytes;      // size of the SpirvShaderTranslator::SystemConstants blob
     uint32_t shared_bytes;   // size of the shared-memory (vertex) blob

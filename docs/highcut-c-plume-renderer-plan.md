@@ -212,9 +212,18 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     vertices (rebased SSBO), applied the real `ndc_scale/offset`, and produced the right geometry.
     Validation-clean, stable. The full pipeline guest-draw → ported translator → plume render is
     proven correct.
-  - **C-3b.3 (final nit):** RectangleList is drawn as TRIANGLE_LIST → only half the rect (3 of 4
-    corners). Add the 4th vertex (rect → 2 triangles, the SDK's rect expansion) for the FULL quad.
-    Minor — the core is proven. Then C-4 (textures), C-5 (full frame).
+  - **C-3b.3 DONE (2026-06-12): FULL rect renders.** The beta path leaves a Xenos RectangleList as
+    host_prim=rect/hvst=kVertex (the SDK D3D12 backend expands rects natively); plume has no rect
+    primitive, so the P-3 translation now forces `kRectangleListAsTriangleStrip` for rect draws (the
+    VS synthesizes the 4th corner in-shader), the packet carries a `topology` field (→ TRIANGLE_STRIP)
+    + host vertex count (4 per rect), and the plume pipeline is created with that topology. Result:
+    **921,600 fragments = exactly 1280×720 (full screen)** — the complete full-screen rect, up from
+    the 460,800 half. Validation-clean. **C-3 (one real decoded guest draw, rendered correctly) is
+    COMPLETE.**
+
+- **C-4 — textures (NEXT).** The C-3 draw has no textures (tex_bindings=0). Find a textured menu
+  draw (tex_bindings>0), translate its PS too, untile the guest texture (Xenos tiled → linear) into a
+  plume texture, bind sampler+SRV, render textured. Then C-5 (full frame), C-6 (takeover).
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest

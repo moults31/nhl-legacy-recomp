@@ -1580,8 +1580,17 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     rg::SpirvShaderTranslator p3_xlat(p3_features, /*native_2x_msaa_with_attachments=*/false,
                                       /*native_2x_msaa_no_attachments=*/false,
                                       /*edram_fragment_shader_interlock=*/false);
+    // C-3b.3: a Xenos RectangleList is left as host_prim=rect/hvst=kVertex by the beta path (the
+    // SDK D3D12 backend expands rects natively). plume has no rect primitive, so translate the VS
+    // as kRectangleListAsTriangleStrip — it synthesizes the 4th corner in-shader — and draw a
+    // 4-vertex triangle strip on plume (full quad instead of the 3-corner half).
+    auto p3_hvst = result.host_vertex_shader_type;
+    if (result.guest_primitive_type == xenos::PrimitiveType::kRectangleList &&
+        p3_hvst == rg::Shader::HostVertexShaderType::kVertex) {
+      p3_hvst = rg::Shader::HostVertexShaderType::kRectangleListAsTriangleStrip;
+    }
     const uint64_t p3_mod =
-        p3_xlat.GetDefaultVertexShaderModification(p3_reg_count, result.host_vertex_shader_type);
+        p3_xlat.GetDefaultVertexShaderModification(p3_reg_count, p3_hvst);
     bool p3_is_new = false;
     rg::Shader::Translation* p3_tr = p3_vs.GetOrCreateTranslation(p3_mod, &p3_is_new);
     const bool p3_ok = p3_xlat.TranslateAnalyzedShader(*p3_tr);
@@ -1819,11 +1828,24 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // Shared-memory (vertex) bytes from guest RAM at the rebased range.
     const uint8_t* vtx_src =
         vtx_size ? memory_->TranslatePhysical<const uint8_t*>(vtx_base) : nullptr;
+    REXLOG_INFO("[highcut-C3b3] draw types: guest_prim={} host_prim={} hvst={} host_vtx_count={} "
+                "index_count(param)={} idx_type={}",
+                uint32_t(result.guest_primitive_type), uint32_t(result.host_primitive_type),
+                uint32_t(result.host_vertex_shader_type), result.host_draw_vertex_count,
+                index_count, uint32_t(result.index_buffer_type));
     nhl::highcut::DrawPacketHeader hdr{};
     hdr.magic = nhl::highcut::kDrawPacketMagic;
     hdr.version = nhl::highcut::kDrawPacketVersion;
-    hdr.vertex_count = result.host_draw_vertex_count;
-    hdr.prim_type = uint32_t(primitive_type);
+    // C-3b.3: pick the plume topology + host vertex count to match the translated VS. For a rect
+    // list translated as kRectangleListAsTriangleStrip, each guest rect (3 verts) becomes a
+    // 4-vertex triangle strip; otherwise draw the guest verts as a triangle list.
+    if (result.guest_primitive_type == xenos::PrimitiveType::kRectangleList) {
+      hdr.topology = nhl::highcut::kTopoTriangleStrip;
+      hdr.vertex_count = (index_count / 3) * 4;  // 4 strip verts per guest rect (single rect -> 4)
+    } else {
+      hdr.topology = nhl::highcut::kTopoTriangleList;
+      hdr.vertex_count = index_count;
+    }
     hdr.fetch_bytes = sizeof(fetch_blob);
     hdr.sys_bytes = sizeof(spv_sys);
     hdr.shared_bytes = vtx_src ? vtx_size : 0u;
@@ -1833,9 +1855,9 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       std::fwrite(&spv_sys, 1, sizeof(spv_sys), pf);
       if (hdr.shared_bytes) std::fwrite(vtx_src, 1, hdr.shared_bytes, pf);
       std::fclose(pf);
-      REXLOG_INFO("[highcut-C3b2] dumped draw packet: verts={} prim={} vtx_base=0x{:X} "
+      REXLOG_INFO("[highcut-C3b2] dumped draw packet: verts={} topo={} vtx_base=0x{:X} "
                   "vtx_size={} ndc_scale=({},{}) ndc_offset=({},{}) base_idx={}",
-                  hdr.vertex_count, hdr.prim_type, vtx_base, vtx_size, spv_sys.ndc_scale[0],
+                  hdr.vertex_count, hdr.topology, vtx_base, vtx_size, spv_sys.ndc_scale[0],
                   spv_sys.ndc_scale[1], spv_sys.ndc_offset[0], spv_sys.ndc_offset[1],
                   spv_sys.vertex_base_index);
     }

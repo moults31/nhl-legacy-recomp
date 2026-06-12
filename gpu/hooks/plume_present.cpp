@@ -322,6 +322,18 @@ void RenderClear(PlumeCtx& c) {
                 const char* c3gate = std::getenv("NHL_HIGHCUT_C3");
                 if (c.xlatVS && c3gate) {
                     const bool emptyLayout = std::strcmp(c3gate, "empty") == 0;
+                    // C-3b.3: peek the draw packet's topology so the pipeline is created with the
+                    // primitive the translated VS expects (RectangleList -> rect-strip VS -> a
+                    // 4-vertex TRIANGLE_STRIP; else TRIANGLE_LIST).
+                    auto pktTopo = RenderPrimitiveTopology::TRIANGLE_LIST;
+                    if (FILE* tf = std::fopen("highcut_p3_draw.bin", "rb")) {
+                        nhl::highcut::DrawPacketHeader th{};
+                        if (std::fread(&th, 1, sizeof(th), tf) == sizeof(th) &&
+                            th.magic == nhl::highcut::kDrawPacketMagic &&
+                            th.topology == nhl::highcut::kTopoTriangleStrip)
+                            pktTopo = RenderPrimitiveTopology::TRIANGLE_STRIP;
+                        std::fclose(tf);
+                    }
                     c.xlatPS = c.device->createShader(solidFragBlobSPIRV, sizeof(solidFragBlobSPIRV), "PSMain", fmt);
                     REXLOG_INFO("[highcut-C3a] step: solid PS module {} (layout mode='{}')",
                                 c.xlatPS ? "ok" : "null", emptyLayout ? "empty" : "full");
@@ -355,7 +367,7 @@ void RenderClear(PlumeCtx& c) {
                         pd.renderTargetFormat[0] = kSwapFormat;
                         pd.renderTargetBlend[0] = RenderBlendDesc::Copy();
                         pd.renderTargetCount = 1;
-                        pd.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
+                        pd.primitiveTopology = pktTopo;
                         c.xlatPipeline = c.device->createGraphicsPipeline(pd);
                         REXLOG_INFO("[highcut-C3a] graphics pipeline (layout={}): {} "
                                     "— any pipeline/driver error is on stderr.",
@@ -423,9 +435,9 @@ void RenderClear(PlumeCtx& c) {
                                         fillBuf(c.xlatSharedBuf.get(), kSharedSize, hdr.shared_bytes);
                                         c.xlatVertexCount = hdr.vertex_count ? hdr.vertex_count : 3;
                                         REXLOG_INFO("[highcut-C3b2] filled buffers from packet: verts={} "
-                                                    "fetch={} sys={} shared={} prim={}",
+                                                    "fetch={} sys={} shared={} topo={}",
                                                     hdr.vertex_count, hdr.fetch_bytes, hdr.sys_bytes,
-                                                    hdr.shared_bytes, hdr.prim_type);
+                                                    hdr.shared_bytes, hdr.topology);
                                     }
                                     std::fclose(pf);
                                 } else {
