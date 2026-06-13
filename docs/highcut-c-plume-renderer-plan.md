@@ -307,9 +307,19 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
       (`NHL_HIGHCUT_PRESENT=1 NHL_HIGHCUT_C5=1` + validation). Done = several real draws blend
       correctly into one flat RT (a partial menu), 0 VUID. Risks: blend-factor coverage (default
       Copy), intermediate-surface draws (C-5b), capture cost (one-shot N translate+untile).
-  - **C-5b (next):** per-surface flat plume RTs (each guest color/depth surface → its own RT at
+  - **C-5b DONE:** menu fixes (kQuadList text, k_8 font, swizzle, black clear, scissor, RB_COLOR_MASK
+    — menu ~90% faithful). Per-surface flat RTs were RE-NUMBERED to C-5d (below).
+  - **C-5c IMPLEMENTED (build-clean, 3D runtime-verify pending):** depth + stencil buffer + a 3D
+    scene. Shared D32_FLOAT_S8_UINT depth-stencil target on every plume framebuffer (cleared 1.0/0
+    each frame); per-draw depth/stencil/cull captured into packet **v4** (raw Xenos enum values from
+    RB_DEPTHCONTROL/RB_STENCILREFMASK/PA_SU_SC_MODE_CNTL) and mapped to the per-draw plume pipeline.
+    EVERY pipeline declares depthTargetFormat (renderpass-compat); 2D menu draws keep depth disabled.
+    Cull front-face is INVERTED for the replay y-flip (gates NHL_HIGHCUT_NOCULL / NHL_HIGHCUT_FLIP_FACE).
+    Offline check: `tools/highcut_packet_decode.py`. Verify per `_c5dump.ps1`/`_c5render.ps1`; full
+    self-contained record in `docs/highcut-c5c-depth-stencil-prompt.md` + `[[highcut-c-plume-renderer]]`.
+  - **C-5d (next):** per-surface flat plume RTs (each guest color/depth surface → its own RT at
     logical size) + guest Resolve = host copy → plume-texture keyed by dest address; correct
-    render-to-texture composition. **C-5c:** depth + a 3D scene.
+    render-to-texture composition (shadow maps, rink-cam, post). Also: per-draw viewport for 3D + MSAA.
 - **C-6 — takeover.** Suppress rexglue's present/GPU where possible so plume is the only output;
   optionally switch plume to D3D12 once rexglue's device is off.
 

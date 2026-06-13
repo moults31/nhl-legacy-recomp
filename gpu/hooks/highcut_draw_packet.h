@@ -19,6 +19,7 @@
 //                                    per draw (0 => fall back to the shared highcut_p3_vs.spv)
 //   pixel_shader_spirv[ps_spirv_bytes]  — translated guest PS SPIR-V (0 => VS-only / solid PS path)
 //   for each of texture_count: TexturePacketDesc desc; uint8_t linear_texels[desc.data_bytes];
+//   index_blob[index_bytes]        — (v5) raw guest kGuestDMA indices (u16/u32 per index_format)
 
 #pragma once
 #include <cstdint>
@@ -26,7 +27,7 @@
 namespace nhl::highcut {
 
 constexpr uint32_t kDrawPacketMagic = 0x48334450;  // 'H3DP'
-constexpr uint32_t kDrawPacketVersion = 3;          // C-5a: inline VS SPIR-V + viewport + blend
+constexpr uint32_t kDrawPacketVersion = 5;          // C-5d: + kGuestDMA index buffer (indexed draws)
 
 // Plume topology for the host draw. Xenos RectangleList -> kRectangleListAsTriangleStrip (4-vert
 // strip). kQuadList (menu text/glyphs) has no host-shader expansion in the translator, so the plume
@@ -97,6 +98,33 @@ struct DrawPacketHeader {
     // game clips e.g. the right-side description text to its box and the bottom ticker to its bar;
     // without it those overflow (and a draw scissored to ~nothing renders full -> bleed).
     uint32_t sc_left, sc_top, sc_right, sc_bottom;
+    // C-5c: per-draw depth/stencil/cull state (decoded from RB_DEPTHCONTROL / RB_STENCILREFMASK /
+    // PA_SU_SC_MODE_CNTL). func/op fields are the RAW Xenos enum VALUES (xenos::CompareFunction 0..7,
+    // xenos::StencilOp 0..7); the plume side maps them to RenderComparisonFunction / RenderStencilOp.
+    // A 2D menu draw has depth_enable=0 (depth-disabled pipeline) so the flat-RT menu is unaffected.
+    uint32_t depth_enable;        // RB_DEPTHCONTROL.z_enable
+    uint32_t depth_write;         // RB_DEPTHCONTROL.z_write_enable
+    uint32_t depth_func;          // RB_DEPTHCONTROL.zfunc (xenos::CompareFunction)
+    uint32_t stencil_enable;      // RB_DEPTHCONTROL.stencil_enable
+    uint32_t stencil_read_mask;   // RB_STENCILREFMASK.stencilmask (compare/read mask)
+    uint32_t stencil_write_mask;  // RB_STENCILREFMASK.stencilwritemask
+    uint32_t stencil_ref;         // RB_STENCILREFMASK.stencilref
+    // Front/back stencil ops + compare (xenos::StencilOp / xenos::CompareFunction values). Xenos
+    // names map to plume as: fail_op=stencilfail, pass_op=stencilzpass (stencil AND depth pass),
+    // depth_fail_op=stencilzfail (stencil pass, depth fail).
+    uint32_t front_fail_op, front_pass_op, front_depth_fail_op, front_func;
+    uint32_t back_fail_op, back_pass_op, back_depth_fail_op, back_func;
+    uint32_t cull_mode;           // 0=none, 1=front, 2=back
+    uint32_t front_ccw;           // 1 => guest front face is counter-clockwise (PA_SU..face==0).
+                                  // The replay bakes a y-flip into ndc (reverses on-screen winding),
+                                  // so the plume side INVERTS this when picking RenderFrontFace.
+    // C-5d: kGuestDMA index buffer. Most 3D meshes are INDEXED (index_buffer_type==kGuestDMA) — the
+    // index buffer defines triangle connectivity; drawing them non-indexed connects vertices in
+    // storage order -> exploded geometry. The raw guest indices (BIG-endian; the VS swaps
+    // gl_VertexIndex via vertex_index_endian, mirroring the beta kGuestDMA path) are appended at the
+    // VERY END of the packet (after all textures). vertex_count = the index count (drawIndexedInstanced).
+    uint32_t index_format;        // 0 = none (drawInstanced / quad-expand), 1 = u16, 2 = u32
+    uint32_t index_bytes;         // size of the raw index blob appended after the textures
 };
 
 }  // namespace nhl::highcut

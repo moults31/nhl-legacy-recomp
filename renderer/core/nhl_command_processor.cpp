@@ -1883,20 +1883,59 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     namespace rg = rex::graphics;
     const uint32_t* regs = register_file_->values;
     // Fetch constants: the full 192-dword fetch register space -> the shader's uvec4[48] UBO.
-    // REBASE the vertex fetch slot's base address to 0 so the VS indexes our SSBO from offset 0.
+    // Capture ALL vertex bindings: 3D meshes stream position / normal / uv / weights from SEPARATE
+    // guest addresses (one fetch constant each). PACK every binding's bytes tightly into one shared-
+    // memory blob and rebase each binding's fetch-constant address (bits 2..31, in dwords) to its
+    // packed offset, so the translated VS's multi-stream vfetch all indexes our single SSBO. The old
+    // code captured + rebased only vertex_bindings()[0] (fine for the single-stream 2D menu draw),
+    // which left every OTHER stream pointing at its original huge guest address -> garbage positions
+    // -> exploded 3D geometry. (kVtxTotalCap bounds the SSBO; per-stream sizes are dword multiples,
+    // so packed offsets stay dword-aligned and the type bits survive.)
     uint32_t fetch_blob[192];
     std::memcpy(fetch_blob, &regs[0x4800], sizeof(fetch_blob));
-    uint32_t vtx_base = 0, vtx_size = 0;
-    if (!beta_current_vs_->vertex_bindings().empty()) {
-      const auto& vb = beta_current_vs_->vertex_bindings()[0];
-      xenos::xe_gpu_vertex_fetch_t f{};
-      f.dword_0 = regs[0x4800 + vb.fetch_constant * 2];
-      f.dword_1 = regs[0x4800 + vb.fetch_constant * 2 + 1];
-      vtx_base = f.address << 2;
-      vtx_size = f.size << 2;
-      if (vtx_size > 16u * 0x100000u) vtx_size = 16u * 0x100000u;
-      // Rebase: zero the address field (bits 2..31) of dword_0 in the UBO copy, keep type bits.
-      fetch_blob[vb.fetch_constant * 2] &= 0x3u;
+    std::vector<uint8_t> shared_blob;
+    {
+      constexpr uint32_t kVtxTotalCap = 16u * 0x100000u;  // 16 MB total across all streams
+      for (const auto& vb : beta_current_vs_->vertex_bindings()) {
+        const uint32_t idx = vb.fetch_constant * 2;
+        xenos::xe_gpu_vertex_fetch_t f{};
+        f.dword_0 = regs[0x4800 + idx];
+        f.dword_1 = regs[0x4800 + idx + 1];
+        const uint32_t base = f.address << 2;  // guest byte base
+        uint32_t size = f.size << 2;           // byte size (size is in dwords)
+        if (!size) continue;
+        const uint32_t packed_off = uint32_t(shared_blob.size());  // dword-aligned (sizes are *4)
+        if (packed_off + size > kVtxTotalCap) {
+          if (packed_off >= kVtxTotalCap) break;
+          size = kVtxTotalCap - packed_off;
+        }
+        const uint8_t* src = memory_ ? memory_->TranslatePhysical<const uint8_t*>(base) : nullptr;
+        shared_blob.resize(packed_off + size);
+        if (src) std::memcpy(shared_blob.data() + packed_off, src, size);
+        else std::memset(shared_blob.data() + packed_off, 0, size);
+        // Rebase: dword_0 = (packed_dword_offset << 2) | type_bits. packed_off is a dword multiple.
+        fetch_blob[idx] = packed_off | (fetch_blob[idx] & 0x3u);
+      }
+    }
+    // C-5d: kGuestDMA index buffer — the bulk of 3D draws are INDEXED (idx_type=1); the index buffer
+    // defines triangle connectivity. Drawing them non-indexed (drawInstanced over sequential vertex
+    // ids) connects vertices in storage order -> wrong triangles -> exploded geometry. Capture the
+    // RAW guest indices (big-endian; the VS swaps gl_VertexIndex via vertex_index_endian, exactly as
+    // the beta kGuestDMA path relies on) so the replay can drawIndexedInstanced. kNone draws (TriList/
+    // Rect/Quad) keep index_format=0. kHostConverted/kHostBuiltin (host-owned buffers, not in guest
+    // RAM) don't appear in this title's frames; if they ever do they fall back to drawInstanced.
+    std::vector<uint8_t> index_blob;
+    uint32_t index_format = 0;  // 0=none, 1=u16, 2=u32
+    if (result.index_buffer_type ==
+            rex::graphics::PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+        index_buffer_info && memory_) {
+      const uint32_t ilen = uint32_t(index_buffer_info->length);
+      const uint8_t* isrc = memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base);
+      if (isrc && ilen) {
+        index_blob.assign(isrc, isrc + ilen);
+        index_format =
+            (index_buffer_info->format == xenos::IndexFormat::kInt32) ? 2u : 1u;
+      }
     }
     // System constants (SPIR-V layout): NDC transform + vertex index params + (C-4) the
     // PS-critical fields. color_exp_bias MUST be set or the PS's final `oC0 = color * exp_bias`
@@ -1943,9 +1982,9 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       const float color_scale = std::exp2f(float(guest_exp_bias));
       for (int i = 0; i < 4; ++i) spv_sys.color_exp_bias[i] = color_scale;
     }
-    // Shared-memory (vertex) bytes from guest RAM at the rebased range.
-    const uint8_t* vtx_src =
-        vtx_size ? memory_->TranslatePhysical<const uint8_t*>(vtx_base) : nullptr;
+    // Shared-memory (vertex) bytes: the packed multi-binding blob built above.
+    const uint8_t* vtx_src = shared_blob.empty() ? nullptr : shared_blob.data();
+    const uint32_t vtx_size = uint32_t(shared_blob.size());
 
     // Bool/loop constants (8 bool + 32 loop dwords at 0x4900) — the b/loop UBO (set1 binding 3).
     const uint8_t* bool_src = reinterpret_cast<const uint8_t*>(&regs[0x4900]);
@@ -2114,6 +2153,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     hdr.ps_spirv_bytes = uint32_t(p3_ps_spirv.size());
     hdr.texture_count = uint32_t(tex_descs.size());
     hdr.ps_sampler_count = p3_ps_sampler_count;
+    hdr.index_format = index_format;                     // C-5d: kGuestDMA indices (0 => non-indexed)
+    hdr.index_bytes = uint32_t(index_blob.size());
     // C-5a: per-draw viewport (final vpi) so the plume replay places each draw correctly.
     hdr.vp_x = float(vpi.xy_offset[0]);
     hdr.vp_y = float(vpi.xy_offset[1]);
@@ -2160,6 +2201,60 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       };
       hdr.sc_left = sx(gl); hdr.sc_top = sy(gt); hdr.sc_right = sx(gr); hdr.sc_bottom = sy(gb);
     }
+    // C-5c: per-draw depth/stencil/cull state. `ndc` (RB_DEPTHCONTROL, normalized via
+    // GetNormalizedDepthControl above) holds z/stencil enables + funcs + ops; PA_SU_SC_MODE_CNTL and
+    // RB_STENCILREFMASK are read fresh (the NHL_BETA_NOCULL/NOBLEND register edits were already
+    // restored at this point). func/op fields are RAW Xenos enum values; the plume side maps them.
+    hdr.depth_enable = ndc.z_enable;
+    hdr.depth_write = ndc.z_write_enable;
+    hdr.depth_func = uint32_t(ndc.zfunc);
+    hdr.stencil_enable = ndc.stencil_enable;
+    {
+      reg::RB_STENCILREFMASK sref;
+      reg::RB_STENCILREFMASK sref_bf;
+      sref.value = (*register_file_)[0x210D];     // RB_STENCILREFMASK (front)
+      sref_bf.value = (*register_file_)[0x210C];  // RB_STENCILREFMASK_BF (back)
+      hdr.stencil_ref = sref.stencilref;
+      hdr.stencil_read_mask = sref.stencilmask;
+      hdr.stencil_write_mask = sref.stencilwritemask;
+      hdr.front_func = uint32_t(ndc.stencilfunc);
+      hdr.front_fail_op = uint32_t(ndc.stencilfail);
+      hdr.front_pass_op = uint32_t(ndc.stencilzpass);
+      hdr.front_depth_fail_op = uint32_t(ndc.stencilzfail);
+      if (ndc.backface_enable) {  // separate back-face stencil state
+        hdr.back_func = uint32_t(ndc.stencilfunc_bf);
+        hdr.back_fail_op = uint32_t(ndc.stencilfail_bf);
+        hdr.back_pass_op = uint32_t(ndc.stencilzpass_bf);
+        hdr.back_depth_fail_op = uint32_t(ndc.stencilzfail_bf);
+        // (plume carries one stencilReference/masks; back ref/masks from RB_STENCILREFMASK_BF are
+        // unused for now — front/back ref differences are rare in NHL Legacy. sref_bf decoded for
+        // diagnostics only.)
+        (void)sref_bf;
+      } else {  // back mirrors front
+        hdr.back_func = hdr.front_func;
+        hdr.back_fail_op = hdr.front_fail_op;
+        hdr.back_pass_op = hdr.front_pass_op;
+        hdr.back_depth_fail_op = hdr.front_depth_fail_op;
+      }
+    }
+    {
+      const auto mc = register_file_->Get<reg::PA_SU_SC_MODE_CNTL>();
+      uint32_t cull = mc.cull_front ? 1u : (mc.cull_back ? 2u : 0u);
+      // NHL_HIGHCUT_NOCULL: capture cull as disabled (bring-up: prove geometry before culling).
+      if (std::getenv("NHL_HIGHCUT_NOCULL")) cull = 0u;
+      hdr.cull_mode = cull;
+      hdr.front_ccw = mc.face ? 0u : 1u;  // face: 0=front CCW, 1=front CW
+    }
+    // C-5a/c: detect a NEW guest frame (frame_index_ advanced) and reset the per-frame dump index so
+    // this frame overwrites highcut_frame_0..N. This replaces the old IssueSwap-based reset: live-3D
+    // takeover can be killed mid-frame BEFORE its IssueSwap is ever reached (the swap deadlocks / the
+    // process exits during the slow per-draw translate+untile+dump), so any reset/finalize gated on
+    // IssueSwap never ran and the count file was never written. Resetting here (in the draw path,
+    // which always runs) makes capture independent of the swap completing.
+    if (frame_capture && frame_index_ != highcut_last_frame_index_) {
+      highcut_last_frame_index_ = frame_index_;
+      highcut_capture_idx_ = 0;
+    }
     char pkt_path[64];
     if (frame_capture) {
       std::snprintf(pkt_path, sizeof(pkt_path), "highcut_frame_%u.bin", highcut_capture_idx_);
@@ -2180,14 +2275,31 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         std::fwrite(&tex_descs[i], 1, sizeof(tex_descs[i]), pf);
         std::fwrite(tex_blobs[i].data(), 1, tex_blobs[i].size(), pf);
       }
+      if (hdr.index_bytes) std::fwrite(index_blob.data(), 1, hdr.index_bytes, pf);  // C-5d, last
       std::fclose(pf);
       REXLOG_INFO("[highcut-{}] dumped {}: verts={} topo={} vp=({},{},{},{}) cwm=0x{:X} "
-                  "vs_spirv={} ps_spirv={} textures={} blend=src{}/dst{}/op{} flags=0x{:X}",
+                  "vs_spirv={} ps_spirv={} textures={} vbinds={} shared={} blend=src{}/dst{}/op{} "
+                  "flags=0x{:X} idx(fmt={} bytes={}) depth(en={} wr={} fn={}) stencil(en={} ref={} "
+                  "rd=0x{:X} wr=0x{:X} ffn={}) cull={} ccw={}",
                   frame_capture ? "C5" : "C4", pkt_path, hdr.vertex_count, hdr.topology, hdr.vp_x,
                   hdr.vp_y, hdr.vp_w, hdr.vp_h, hdr.color_write_mask, hdr.vs_spirv_bytes,
-                  hdr.ps_spirv_bytes, hdr.texture_count, hdr.blend_src, hdr.blend_dst, hdr.blend_op,
-                  spv_sys.flags);
-      if (frame_capture) ++highcut_capture_idx_;
+                  hdr.ps_spirv_bytes, hdr.texture_count,
+                  uint32_t(beta_current_vs_->vertex_bindings().size()), hdr.shared_bytes,
+                  hdr.blend_src, hdr.blend_dst, hdr.blend_op,
+                  spv_sys.flags, hdr.index_format, hdr.index_bytes, hdr.depth_enable, hdr.depth_write,
+                  hdr.depth_func, hdr.stencil_enable, hdr.stencil_ref, hdr.stencil_read_mask,
+                  hdr.stencil_write_mask, hdr.front_func, hdr.cull_mode, hdr.front_ccw);
+      if (frame_capture) {
+        ++highcut_capture_idx_;
+        // Rewrite the running count after EVERY dumped draw — the captured frame must be replayable
+        // even if the live-3D IssueSwap never completes (deadlock / mid-frame kill). The plume replay
+        // loads exactly this many highcut_frame_<N>.bin; stale higher-index bins from a longer prior
+        // frame are ignored.
+        if (std::FILE* cf = std::fopen("highcut_frame.count", "w")) {
+          std::fprintf(cf, "%u\n", highcut_capture_idx_);
+          std::fclose(cf);
+        }
+      }
     }
   }
 
@@ -5314,6 +5426,10 @@ void NhlD3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t fron
     }
   }
 
+  // (C-5 frame-capture finalize is now done in the draw path — highcut_frame.count is rewritten
+  // after every dumped draw and the index resets on frame_index_ change. IssueSwap is NOT a reliable
+  // finalize point: live-3D takeover can be killed mid-frame before this swap is ever reached.)
+
   d3d12::D3D12CommandProcessor::IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   // LIVE mode: present our just-rendered RT to the window, then reset per-frame state so the
@@ -5339,18 +5455,8 @@ void NhlD3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t fron
     beta_depth_cleared_ = false;
     beta_live_frame_req_bytes_ = 0;  // per-draw residency upload accounting resets per frame
     beta_live_frame_inv_bytes_ = 0;
-    // C-5a frame capture: write the count of owned draws dumped this frame (highcut_frame.count) so
-    // the plume replay knows how many highcut_frame_<N>.bin to load, then reset (next frame
-    // overwrites). The last fully-captured frame before exit is the one the replay sees.
-    if (std::getenv("NHL_HIGHCUT_FRAME_CAPTURE") && highcut_capture_idx_ > 0) {
-      if (std::FILE* cf = std::fopen("highcut_frame.count", "w")) {
-        std::fprintf(cf, "%u\n", highcut_capture_idx_);
-        std::fclose(cf);
-      }
-      REXLOG_INFO("[highcut-C5] frame captured: {} owned draws -> highcut_frame.count",
-                  highcut_capture_idx_);
-    }
-    highcut_capture_idx_ = 0;
+    // (C-5 frame-capture finalize moved to right after the base IssueSwap above so it runs in BOTH
+    // live and non-live takeover, and even when the live-3D present path doesn't complete.)
   }
 
   // Oracle RenderDoc bracket end (base path, no takeover).

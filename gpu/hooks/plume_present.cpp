@@ -79,6 +79,9 @@ constexpr uint32_t kBufferCount = 2;
 constexpr uint32_t kWidth = 1280;   // the game's logical size (proven in H-1)
 constexpr uint32_t kHeight = 720;
 constexpr RenderFormat kSwapFormat = RenderFormat::B8G8R8A8_UNORM;
+// C-5c: the shared depth+stencil attachment format. Every framebuffer carries one, so EVERY pipeline
+// must declare this depthTargetFormat (else its renderpass is incompatible with the framebuffer's).
+constexpr RenderFormat kDepthFormat = RenderFormat::D32_FLOAT_S8_UINT;
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -101,9 +104,10 @@ struct RenderableDraw {
     std::unique_ptr<RenderPipelineLayout> layout;
     std::unique_ptr<RenderDescriptorSet> set0, set1, set3;
     std::unique_ptr<RenderPipeline> pipeline;
-    std::unique_ptr<RenderBuffer> indexBuf;  // C-5a.1: quad-list expansion ({0,1,2,0,2,3}/quad)
+    std::unique_ptr<RenderBuffer> indexBuf;  // quad-list expansion (C-5a.1) OR kGuestDMA (C-5d)
     uint32_t vertexCount = 0;
-    uint32_t indexCount = 0;  // >0 => drawIndexedInstanced (quad expand); else drawInstanced
+    uint32_t indexCount = 0;  // >0 => drawIndexedInstanced (quad expand / DMA); else drawInstanced
+    bool indexU32 = true;     // index buffer element size: true=R32_UINT (quad expand), false=R16_UINT
     bool textured = false;  // has set3 (textures+samplers) bound
     int32_t scLeft = 0, scTop = 0, scRight = 0, scBottom = 0;  // C-5b: per-draw clip (RT px)
 };
@@ -119,6 +123,9 @@ struct PlumeCtx {
     std::unique_ptr<RenderCommandSemaphore> acquireSem;
     std::vector<std::unique_ptr<RenderCommandSemaphore>> releaseSems;
     std::vector<std::unique_ptr<RenderFramebuffer>> fbs;
+    // C-5c: a single shared depth+stencil target (D32_FLOAT_S8_UINT) attached to every framebuffer,
+    // so 3D draws get correct occlusion and stencil-masked draws behave. Recreated with the swapchain.
+    std::unique_ptr<RenderTexture> depthTex;
     // C-1 geometry: minimal triangle pipeline + vertex buffer (proves the plume render path).
     std::unique_ptr<RenderPipelineLayout> pipelineLayout;
     std::unique_ptr<RenderShader> vs;
@@ -199,12 +206,18 @@ HWND CreatePlumeWindow() {
 
 void CreateFramebuffers(PlumeCtx& c) {
     c.fbs.clear();
+    // C-5c: (re)create the shared depth+stencil target to match the swapchain size, then attach it to
+    // every framebuffer. Pass only the texture — plume derives the correct both-aspect (depth+stencil)
+    // attachment view internally for D32_FLOAT_S8_UINT. DEPTH_TARGET flag is set by DepthTarget().
+    const uint32_t dw = c.swap->getWidth(), dh = c.swap->getHeight();
+    c.depthTex = c.device->createTexture(RenderTextureDesc::DepthTarget(dw, dh, kDepthFormat));
+    if (!c.depthTex) REXLOG_ERROR("[highcut-plume] depth-stencil target create failed");
     for (uint32_t i = 0; i < c.swap->getTextureCount(); ++i) {
         const RenderTexture* color = c.swap->getTexture(i);
         RenderFramebufferDesc d;
         d.colorAttachments = &color;
         d.colorAttachmentsCount = 1;
-        d.depthAttachment = nullptr;
+        d.depthAttachment = c.depthTex.get();
         c.fbs.push_back(c.device->createFramebuffer(d));
     }
 }
@@ -246,6 +259,7 @@ bool CreateTriangle(PlumeCtx& c) {
     pd.renderTargetFormat[0] = kSwapFormat;
     pd.renderTargetBlend[0] = RenderBlendDesc::Copy();
     pd.renderTargetCount = 1;
+    pd.depthTargetFormat = kDepthFormat;  // C-5c: framebuffer has depth; declare it (depth test off)
     pd.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
     c.pipeline = c.device->createGraphicsPipeline(pd);
     if (!c.pipeline) { REXLOG_ERROR("[highcut-plume] triangle pipeline create failed"); return false; }
@@ -464,6 +478,7 @@ bool CreateTexturedDraw(PlumeCtx& c) {
     pd.renderTargetFormat[0] = kSwapFormat;
     pd.renderTargetBlend[0] = RenderBlendDesc::Copy();
     pd.renderTargetCount = 1;
+    pd.depthTargetFormat = kDepthFormat;  // C-5c: framebuffer has depth; declare it (depth test off)
     pd.primitiveTopology = topo;
     c.xlatTexPipeline = c.device->createGraphicsPipeline(pd);
     if (!c.xlatTexPipeline) { REXLOG_ERROR("[highcut-C4] textured graphics pipeline create failed"); return false; }
@@ -503,6 +518,43 @@ RenderBlendOperation toPlumeBlendOp(uint32_t o) {
         case hc::kBlendOpMax: return RenderBlendOperation::MAX;
         default: return RenderBlendOperation::ADD;
     }
+}
+
+// C-5c: map the raw Xenos depth/stencil/cull enum VALUES the packet carries to plume's enums.
+// xenos::CompareFunction: 0=Never 1=Less 2=Equal 3=LessEqual 4=Greater 5=NotEqual 6=GreaterEqual 7=Always.
+RenderComparisonFunction toPlumeCompare(uint32_t f) {
+    switch (f & 7) {
+        case 0: return RenderComparisonFunction::NEVER;
+        case 1: return RenderComparisonFunction::LESS;
+        case 2: return RenderComparisonFunction::EQUAL;
+        case 3: return RenderComparisonFunction::LESS_EQUAL;
+        case 4: return RenderComparisonFunction::GREATER;
+        case 5: return RenderComparisonFunction::NOT_EQUAL;
+        case 6: return RenderComparisonFunction::GREATER_EQUAL;
+        default: return RenderComparisonFunction::ALWAYS;
+    }
+}
+// xenos::StencilOp: 0=Keep 1=Zero 2=Replace 3=IncrClamp 4=DecrClamp 5=Invert 6=IncrWrap 7=DecrWrap.
+RenderStencilOp toPlumeStencilOp(uint32_t o) {
+    switch (o & 7) {
+        case 0: return RenderStencilOp::KEEP;
+        case 1: return RenderStencilOp::ZERO;
+        case 2: return RenderStencilOp::REPLACE;
+        case 3: return RenderStencilOp::INCREMENT_AND_CLAMP;
+        case 4: return RenderStencilOp::DECREMENT_AND_CLAMP;
+        case 5: return RenderStencilOp::INVERT;
+        case 6: return RenderStencilOp::INCREMENT_AND_WRAP;
+        default: return RenderStencilOp::DECREMENT_AND_WRAP;
+    }
+}
+RenderStencilFaceDesc toPlumeStencilFace(uint32_t fail_op, uint32_t pass_op, uint32_t depth_fail_op,
+                                         uint32_t func) {
+    RenderStencilFaceDesc d;
+    d.failOp = toPlumeStencilOp(fail_op);
+    d.passOp = toPlumeStencilOp(pass_op);
+    d.depthFailOp = toPlumeStencilOp(depth_fail_op);
+    d.compareFunction = toPlumeCompare(func);
+    return d;
 }
 
 // C-5a: map a Xenos 3-bit texture-swizzle component (0=R,1=G,2=B,3=A,4=0,5=1) to plume's enum, and
@@ -565,6 +617,9 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         if (!t.data && t.desc.data_bytes) return false;
         texs.push_back(t);
     }
+    // C-5d: kGuestDMA index blob (raw guest indices, last in the packet).
+    const uint8_t* idxData = hdr.index_bytes ? take(hdr.index_bytes) : nullptr;
+    if (hdr.index_bytes && !idxData) return false;
 
     d.vs = c.device->createShader(vsSpirv, hdr.vs_spirv_bytes, "main", fmt);
     d.ps = c.device->createShader(psSpirv, hdr.ps_spirv_bytes, "main", fmt);
@@ -572,7 +627,13 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     const bool textured = hdr.texture_count > 0;
     d.textured = textured;
 
-    constexpr uint64_t kSys = 2048, kBool = 256, kFetch = 768, kFloat = 256 * 16, kShared = 1u << 16;
+    constexpr uint64_t kSys = 2048, kBool = 256, kFetch = 768, kFloat = 256 * 16;
+    // C-5c: size the shared-memory (vertex) SSBO to THIS draw's data, not a fixed 64K. 3D meshes
+    // pack multiple vertex streams (position/normal/uv/...) and can be hundreds of KB — a fixed 64K
+    // truncated them, dropping the tail vertices to garbage -> exploded geometry. Floor 64K (small
+    // draws / safety), cap 16MB (matches the capture cap).
+    const uint64_t kShared = std::min<uint64_t>(
+        std::max<uint64_t>(hdr.shared_bytes, 1u << 16), 16u * 0x100000u);
     auto mkUbo = [&](uint64_t sz, const uint8_t* src, uint32_t srcN) {
         auto b = c.device->createBuffer(RenderBufferDesc::UploadBuffer(sz, RenderBufferFlag::CONSTANT));
         if (b) {
@@ -708,8 +769,16 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
             const uint64_t bytes = idx.size() * sizeof(uint32_t);
             d.indexBuf = c.device->createBuffer(RenderBufferDesc::IndexBuffer(bytes, RenderHeapType::UPLOAD));
             if (d.indexBuf) { void* p = d.indexBuf->map(); std::memcpy(p, idx.data(), bytes); d.indexBuf->unmap(); }
-            if (d.indexBuf) d.indexCount = uint32_t(idx.size());
+            if (d.indexBuf) { d.indexCount = uint32_t(idx.size()); d.indexU32 = true; }
         }
+    } else if (hdr.index_format != 0 && idxData && hdr.index_bytes) {
+        // C-5d: kGuestDMA indexed draw — upload the raw guest indices verbatim (the VS swaps
+        // gl_VertexIndex via vertex_index_endian, so no host byte-swap), then drawIndexedInstanced.
+        // vertex_count carries the INDEX count for these draws.
+        d.indexBuf = c.device->createBuffer(
+            RenderBufferDesc::IndexBuffer(hdr.index_bytes, RenderHeapType::UPLOAD));
+        if (d.indexBuf) { void* p = d.indexBuf->map(); std::memcpy(p, idxData, hdr.index_bytes); d.indexBuf->unmap(); }
+        if (d.indexBuf) { d.indexCount = hdr.vertex_count; d.indexU32 = (hdr.index_format == 2); }
     }
     RenderGraphicsPipelineDesc pd;
     pd.pipelineLayout = d.layout.get();
@@ -719,6 +788,34 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     pd.renderTargetBlend[0] = blend;
     pd.renderTargetCount = 1;
     pd.primitiveTopology = topo;
+    pd.depthTargetFormat = kDepthFormat;
+    // C-5c: per-draw depth/stencil/cull (the packet carries raw Xenos enum values). 2D menu draws
+    // have depth_enable=0 -> depth test/write off, so the flat-RT menu composites exactly as before.
+    pd.depthEnabled = hdr.depth_enable != 0;
+    pd.depthWriteEnabled = hdr.depth_write != 0;
+    pd.depthFunction = toPlumeCompare(hdr.depth_func);
+    pd.depthClipEnabled = true;
+    pd.stencilEnabled = hdr.stencil_enable != 0;
+    pd.stencilReadMask = hdr.stencil_read_mask;
+    pd.stencilWriteMask = hdr.stencil_write_mask;
+    pd.stencilReference = hdr.stencil_ref;
+    pd.stencilFrontFace = toPlumeStencilFace(hdr.front_fail_op, hdr.front_pass_op,
+                                             hdr.front_depth_fail_op, hdr.front_func);
+    pd.stencilBackFace = toPlumeStencilFace(hdr.back_fail_op, hdr.back_pass_op,
+                                            hdr.back_depth_fail_op, hdr.back_func);
+    // Cull. NHL_HIGHCUT_NOCULL force-disables it at replay time (bring-up). The replay bakes a y-flip
+    // into ndc, which REVERSES on-screen triangle winding, so a guest CCW front face is CW on our RT
+    // -> invert front_ccw when choosing RenderFrontFace (NHL_HIGHCUT_FLIP_FACE toggles to test this).
+    static const bool no_cull = std::getenv("NHL_HIGHCUT_NOCULL") != nullptr;
+    static const bool flip_face = std::getenv("NHL_HIGHCUT_FLIP_FACE") != nullptr;
+    pd.cullMode = no_cull ? RenderCullMode::NONE
+                : (hdr.cull_mode == 1 ? RenderCullMode::FRONT
+                : (hdr.cull_mode == 2 ? RenderCullMode::BACK : RenderCullMode::NONE));
+    bool front_ccw_screen = (hdr.front_ccw != 0);  // guest convention
+    front_ccw_screen = !front_ccw_screen;          // y-flip reverses winding on our RT
+    if (flip_face) front_ccw_screen = !front_ccw_screen;
+    pd.frontFace = front_ccw_screen ? RenderFrontFace::COUNTER_CLOCKWISE
+                                    : RenderFrontFace::CLOCKWISE;
     d.pipeline = c.device->createGraphicsPipeline(pd);
     if (!d.pipeline) return false;
     d.vertexCount = hdr.vertex_count ? hdr.vertex_count : 3;
@@ -774,13 +871,22 @@ void RenderClear(PlumeCtx& c) {
 
     c.cmd->begin();
     RenderTexture* tex = c.swap->getTexture(idx);
-    c.cmd->barriers(RenderBarrierStage::GRAPHICS,
-                    RenderTextureBarrier(tex, RenderTextureLayout::COLOR_WRITE));
+    // C-5c: transition color -> COLOR_WRITE and the shared depth-stencil -> DEPTH_WRITE for this pass.
+    {
+        const RenderTextureBarrier b[] = {
+            RenderTextureBarrier(tex, RenderTextureLayout::COLOR_WRITE),
+            RenderTextureBarrier(c.depthTex.get(), RenderTextureLayout::DEPTH_WRITE),
+        };
+        c.cmd->barriers(RenderBarrierStage::GRAPHICS, b, c.depthTex ? 2u : 1u);
+    }
     c.cmd->setFramebuffer(c.fbs[idx].get());
 
     const uint32_t w = c.swap->getWidth(), h = c.swap->getHeight();
     c.cmd->setViewports(RenderViewport(0.0f, 0.0f, float(w), float(h)));
     c.cmd->setScissors(RenderRect(0, 0, w, h));
+    // C-5c: clear depth to the guest far value (1.0) + stencil to 0 every frame. The renderpass
+    // load-ops LOAD the attachment, so it must hold a defined value; do it once per frame here.
+    if (c.depthTex) c.cmd->clearDepthStencil(true, true, 1.0f, 0);
 
     // C-5: clear to BLACK — the guest framebuffer base behind the menu. (C-1/C-3 used an animated
     // teal/green clear as a "window alive" indicator, but that green showed THROUGH the menu's
@@ -884,6 +990,7 @@ void RenderClear(PlumeCtx& c) {
                         pd.renderTargetFormat[0] = kSwapFormat;
                         pd.renderTargetBlend[0] = RenderBlendDesc::Copy();
                         pd.renderTargetCount = 1;
+                        pd.depthTargetFormat = kDepthFormat;  // C-5c: framebuffer has depth (test off)
                         pd.primitiveTopology = pktTopo;
                         c.xlatPipeline = c.device->createGraphicsPipeline(pd);
                         REXLOG_INFO("[highcut-C3a] graphics pipeline (layout={}): {} "
@@ -1029,9 +1136,10 @@ void RenderClear(PlumeCtx& c) {
             c.cmd->setGraphicsDescriptorSet(d.set0.get(), 0);
             c.cmd->setGraphicsDescriptorSet(d.set1.get(), 1);
             if (d.textured) c.cmd->setGraphicsDescriptorSet(d.set3.get(), 3);
-            if (d.indexCount > 0) {  // C-5a.1: quad-list expansion
-                RenderIndexBufferView iv(d.indexBuf.get(), d.indexCount * uint32_t(sizeof(uint32_t)),
-                                         RenderFormat::R32_UINT);
+            if (d.indexCount > 0) {  // quad-list expansion (R32) or kGuestDMA (R16/R32)
+                const uint32_t istride = d.indexU32 ? 4u : 2u;
+                RenderIndexBufferView iv(d.indexBuf.get(), d.indexCount * istride,
+                                         d.indexU32 ? RenderFormat::R32_UINT : RenderFormat::R16_UINT);
                 c.cmd->setIndexBuffer(&iv);
                 c.cmd->drawIndexedInstanced(d.indexCount, 1, 0, 0, 0);
             } else {
