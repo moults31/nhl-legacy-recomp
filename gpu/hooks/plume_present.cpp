@@ -305,6 +305,7 @@ struct PlumeCtx {
     // C-5a: the captured frame's draws, replayed in order into the swapchain with per-draw blend.
     std::vector<RenderableDraw> c5draws;
     bool c5loaded = false;
+    uint64_t liveSeqSeen = 0;  // C-6: last live-fed frame seq rebuilt (0 = none yet)
     uint64_t frame = 0;
     // C-5d.2: per-surface offscreen render targets. A draw to a NON-primary guest surface renders
     // into its own flat color+depth+stencil RT (cached here, keyed by SurfaceKey) instead of the
@@ -346,6 +347,19 @@ std::atomic<bool> g_threadLaunched{false};
 std::mutex g_xlatMutex;
 std::vector<uint8_t> g_xlatVS;
 bool g_xlatVSReady = false;
+
+// C-6 LIVE FEED: the CP thread pushes each owned draw's packet bytes (same bytes it writes to
+// highcut_frame_<N>.bin) into g_liveBuild, then commits the whole frame at the guest-present boundary.
+// The plume thread swaps the committed frame in and rebuilds its renderable draws — so plume renders
+// the LIVE game in real time instead of replaying one captured frame from disk. Double-buffered: the CP
+// fills g_liveBuild (no lock needed — single CP thread), commit moves it into g_livePending under the
+// lock + bumps the seq; the plume thread reads g_livePending when the seq changes.
+std::mutex g_liveMutex;
+std::vector<std::vector<uint8_t>> g_liveBuild;       // CP thread: this frame's draws, in progress
+std::vector<std::vector<uint8_t>> g_livePendingDraws;// committed frame ready for the plume thread
+std::vector<uint8_t> g_liveBuildResolves;            // CP thread: this frame's resolve sidecar bytes
+std::vector<uint8_t> g_livePendingResolves;
+std::atomic<uint64_t> g_liveSeq{0};                  // bumped on each committed frame
 // Don't touch D3D12 until the game is steadily presenting (past GPU init), or the
 // second device creation races rexglue's init and resets its device.
 constexpr uint64_t kInitAfterGuestFrames = 30;
@@ -1203,38 +1217,54 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
 // the C-5d.3 resolve sidecar.
 PlumeCtx::SurfaceRT* GetOrCreateSurfaceRT(PlumeCtx& c, uint64_t key, uint32_t w, uint32_t h);
 void LoadResolveGraph(PlumeCtx& c);
+void ParseResolveGraphBytes(PlumeCtx& c, const std::vector<uint8_t>& buf);
 
 // C-5a: load the captured frame (highcut_frame.count -> highcut_frame_0..N-1.bin) into renderable
-// draws, once. Each file is a self-contained v3 packet.
-void LoadC5Frames(PlumeCtx& c) {
+// draws. Each packet is self-contained. C-6: with liveDraws != null, load the LIVE-FED frame's packet
+// bytes (from the in-memory bridge) instead of disk — called fresh every time a new live frame arrives.
+void LoadC5Frames(PlumeCtx& c, const std::vector<std::vector<uint8_t>>* liveDraws = nullptr,
+                  const std::vector<uint8_t>* liveResolves = nullptr) {
+    const bool live = liveDraws != nullptr;
+    if (live) {  // a fresh live frame fully replaces the prior — clear derived per-frame state
+        c.c5draws.clear(); c.resolveMap.clear(); c.surfaceDims.clear();
+        c.sampledSrcOrder.clear(); c.c5surfaces.clear();
+    }
     uint32_t count = 0;
-    if (FILE* cf = std::fopen("highcut_frame.count", "r")) {
+    if (live) count = uint32_t(liveDraws->size());
+    else if (FILE* cf = std::fopen("highcut_frame.count", "r")) {
         if (std::fscanf(cf, "%u", &count) != 1) count = 0;
         std::fclose(cf);
     }
-    if (!count) { REXLOG_INFO("[highcut-C5] no highcut_frame.count — run _c5dump.ps1 first"); return; }
+    if (!count) { if (!live) REXLOG_INFO("[highcut-C5] no highcut_frame.count — run _c5dump.ps1 first"); return; }
     // C-5d.3: load the resolve graph BEFORE building draws, so BuildRenderableDraw can flag the PS
     // texture slots that sample a resolve dest (host-copy bindings) as it parses each packet.
-    LoadResolveGraph(c);
+    if (live) ParseResolveGraphBytes(c, *liveResolves);
+    else LoadResolveGraph(c);
     uint32_t built = 0, skipped = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        char path[64];
-        std::snprintf(path, sizeof(path), "highcut_frame_%u.bin", i);
-        std::vector<uint8_t> bytes;
-        if (FILE* f = std::fopen(path, "rb")) {
-            std::fseek(f, 0, SEEK_END);
-            long sz = std::ftell(f);
-            std::fseek(f, 0, SEEK_SET);
-            if (sz > 0) { bytes.resize(size_t(sz)); if (std::fread(bytes.data(), 1, size_t(sz), f) != size_t(sz)) bytes.clear(); }
-            std::fclose(f);
+        std::vector<uint8_t> diskBytes;
+        const std::vector<uint8_t>* bytes = nullptr;
+        if (live) {
+            bytes = &(*liveDraws)[i];
+        } else {
+            char path[64];
+            std::snprintf(path, sizeof(path), "highcut_frame_%u.bin", i);
+            if (FILE* f = std::fopen(path, "rb")) {
+                std::fseek(f, 0, SEEK_END);
+                long sz = std::ftell(f);
+                std::fseek(f, 0, SEEK_SET);
+                if (sz > 0) { diskBytes.resize(size_t(sz)); if (std::fread(diskBytes.data(), 1, size_t(sz), f) != size_t(sz)) diskBytes.clear(); }
+                std::fclose(f);
+            }
+            bytes = &diskBytes;
         }
-        if (bytes.empty()) { ++skipped; continue; }
+        if (bytes->empty()) { ++skipped; continue; }
         RenderableDraw d;
-        if (BuildRenderableDraw(c, bytes, d, i)) { c.c5draws.push_back(std::move(d)); ++built; }
+        if (BuildRenderableDraw(c, *bytes, d, i)) { c.c5draws.push_back(std::move(d)); ++built; }
         else ++skipped;
     }
-    REXLOG_INFO("[highcut-C5] loaded {} renderable draws ({} skipped) of {} captured owned draws",
-                built, skipped, count);
+    REXLOG_INFO("[highcut-C5{}] loaded {} renderable draws ({} skipped) of {} {} owned draws",
+                live ? "-LIVE" : "", built, skipped, count, live ? "live-fed" : "captured");
 
     // C-5d.2: pick the PRIMARY guest surface = the (depth_base,pitch,msaa) tuple with the most draws
     // (the main scene). ONLY that surface renders to the swapchain; EVERY other surface — incl. a
@@ -1379,18 +1409,13 @@ PlumeCtx::SurfaceRT* GetOrCreateSurfaceRT(PlumeCtx& c, uint64_t key, uint32_t w 
 // C-5d.3: load the guest EDRAM resolve graph (highcut_resolves.bin) and build dest_addr -> source
 // surface. Last writer wins for a re-resolved dest (file order == capture stream order); the source
 // SurfaceKey is what we'll render offscreen and host-copy from.
-void LoadResolveGraph(PlumeCtx& c) {
+// C-6: parse the resolve sidecar from a byte buffer (disk file OR the live-feed commit) into resolveMap.
+void ParseResolveGraphBytes(PlumeCtx& c, const std::vector<uint8_t>& buf) {
     namespace hc = nhl::highcut;
-    std::vector<uint8_t> buf;
-    if (FILE* f = std::fopen("highcut_resolves.bin", "rb")) {
-        std::fseek(f, 0, SEEK_END); long sz = std::ftell(f); std::fseek(f, 0, SEEK_SET);
-        if (sz > 0) { buf.resize(size_t(sz)); if (std::fread(buf.data(), 1, size_t(sz), f) != size_t(sz)) buf.clear(); }
-        std::fclose(f);
-    }
-    if (buf.size() < 8) { REXLOG_INFO("[highcut-C5d3] no highcut_resolves.bin — composition has no resolve graph"); return; }
+    if (buf.size() < 8) { REXLOG_INFO("[highcut-C5d3] no resolve graph — composition has none"); return; }
     uint32_t magic = 0, count = 0;
     std::memcpy(&magic, &buf[0], 4); std::memcpy(&count, &buf[4], 4);
-    if (magic != hc::kResolveSidecarMagic) { REXLOG_INFO("[highcut-C5d3] highcut_resolves.bin bad magic"); return; }
+    if (magic != hc::kResolveSidecarMagic) { REXLOG_INFO("[highcut-C5d3] resolve sidecar bad magic"); return; }
     size_t off = 8;
     for (uint32_t i = 0; i < count && off + sizeof(hc::ResolveMarker) <= buf.size(); ++i, off += sizeof(hc::ResolveMarker)) {
         hc::ResolveMarker m{};
@@ -1401,11 +1426,36 @@ void LoadResolveGraph(PlumeCtx& c) {
     REXLOG_INFO("[highcut-C5d3] loaded {} resolve dest mappings from {} markers", uint32_t(c.resolveMap.size()), count);
 }
 
+void LoadResolveGraph(PlumeCtx& c) {
+    namespace hc = nhl::highcut;
+    std::vector<uint8_t> buf;
+    if (FILE* f = std::fopen("highcut_resolves.bin", "rb")) {
+        std::fseek(f, 0, SEEK_END); long sz = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+        if (sz > 0) { buf.resize(size_t(sz)); if (std::fread(buf.data(), 1, size_t(sz), f) != size_t(sz)) buf.clear(); }
+        std::fclose(f);
+    }
+    ParseResolveGraphBytes(c, buf);
+}
+
 void RenderClear(PlumeCtx& c) {
     // C-5a: load the captured frame once, before touching the swapchain (resource creation +
     // texture uploads use the queue, independent of the frame). Gated NHL_HIGHCUT_C5.
     static const bool c5_mode = std::getenv("NHL_HIGHCUT_C5") != nullptr;
-    if (c5_mode && !c.c5loaded) { c.c5loaded = true; LoadC5Frames(c); }
+    // C-6 LIVE FEED: rebuild the renderable draws from the in-memory bridge whenever the CP thread
+    // commits a new frame (g_liveSeq bumps). Replaces the once-from-disk load with a per-new-frame
+    // rebuild so plume tracks the live game. (First cut rebuilds every draw's pipeline per frame —
+    // correctness over speed; a draw/pipeline cache is the next increment.)
+    static const bool live_feed = std::getenv("NHL_HIGHCUT_LIVE_FEED") != nullptr;
+    if (c5_mode && live_feed) {
+        const uint64_t seq = g_liveSeq.load(std::memory_order_acquire);
+        if (seq != c.liveSeqSeen) {
+            std::vector<std::vector<uint8_t>> draws;
+            std::vector<uint8_t> resolves;
+            { std::lock_guard<std::mutex> lk(g_liveMutex);
+              draws.swap(g_livePendingDraws); resolves.swap(g_livePendingResolves); }
+            if (!draws.empty()) { LoadC5Frames(c, &draws, &resolves); c.liveSeqSeen = seq; }
+        }
+    } else if (c5_mode && !c.c5loaded) { c.c5loaded = true; LoadC5Frames(c); }
     uint32_t idx = 0;
     if (c.swap->isEmpty() || !c.swap->acquireTexture(c.acquireSem.get(), &idx)) {
         c.swap->resize();
@@ -1992,4 +2042,26 @@ extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size) {
     std::lock_guard<std::mutex> lk(g_xlatMutex);
     g_xlatVS.assign(data, data + size);
     g_xlatVSReady = true;
+}
+
+// C-6 live feed: CP thread appends one owned draw's packet bytes to the in-progress frame. No lock —
+// only the CP thread touches g_liveBuild between commits.
+extern "C" void HighcutLivePushDraw(const uint8_t* data, size_t size) {
+    if (!g_enabled || !data || !size) return;
+    g_liveBuild.emplace_back(data, data + size);
+}
+// C-6 live feed: CP thread commits the in-progress frame at the guest-present boundary — move it into
+// g_livePending under the lock and bump the seq so the plume thread picks it up. resolves may be null.
+extern "C" void HighcutLiveCommitFrame(const uint8_t* resolves, size_t rsize) {
+    if (!g_enabled) { g_liveBuild.clear(); g_liveBuildResolves.clear(); return; }
+    if (g_liveBuild.empty()) return;  // nothing accumulated (e.g. a non-rendered frame)
+    {
+        std::lock_guard<std::mutex> lk(g_liveMutex);
+        g_livePendingDraws.swap(g_liveBuild);
+        g_livePendingResolves.assign(resolves ? resolves : (const uint8_t*)nullptr,
+                                     resolves ? resolves + rsize : (const uint8_t*)nullptr);
+        g_liveSeq.fetch_add(1, std::memory_order_release);
+    }
+    g_liveBuild.clear();
+    g_liveBuildResolves.clear();
 }

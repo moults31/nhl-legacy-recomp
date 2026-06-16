@@ -1374,6 +1374,11 @@ void NhlD3D12CommandProcessor::HighcutCaptureResolve() {
 // Defined in gpu/hooks/plume_present.cpp — C-2 shader bridge: hand a translated Xenos VS's
 // SPIR-V to the plume Vulkan thread for shader-module creation (no-op unless NHL_HIGHCUT_PRESENT).
 extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size);
+// Defined in gpu/hooks/plume_present.cpp — C-6 LIVE FEED bridge. PushDraw hands one owned draw's packet
+// bytes (the same bytes written to highcut_frame_<N>.bin) to the plume thread's in-progress frame;
+// CommitFrame finalizes it at the guest-present boundary. No-op unless the plume thread is enabled.
+extern "C" void HighcutLivePushDraw(const uint8_t* data, size_t size);
+extern "C" void HighcutLiveCommitFrame(const uint8_t* resolves, size_t rsize);
 
 // Defined in gpu/hooks/d3d9_resources.cpp — C-5d frame delimiter. Bumped on every guest VdSwap
 // (sub_827F1C88), unconditionally, independent of IssueSwap (which live-3D takeover never reaches).
@@ -2476,6 +2481,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // contains the full-res broadcast pass. Mark this frame "good" the moment a >=1024-wide-viewport
     // draw is dumped; at the next boundary, latch a complete good frame and stop capturing.
     static const bool broadcast_guard = std::getenv("NHL_HIGHCUT_CAPTURE_ANYFRAME") == nullptr;
+    static const bool live_feed = std::getenv("NHL_HIGHCUT_LIVE_FEED") != nullptr;  // C-6: feed plume live
     static const uint32_t min_3d_draws = []() {
       const char* s = std::getenv("NHL_HIGHCUT_CAPTURE_MIN3D");
       return s ? uint32_t(std::strtoul(s, nullptr, 10)) : 150u;
@@ -2485,21 +2491,34 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       const uint64_t present_count = HighcutGuestPresentCount();
       if (present_count != highcut_last_present_count_ ||
           frame_index_ != highcut_last_frame_index_) {
+        // C-6 LIVE FEED: commit the just-ENDED frame to the plume bridge (serialize this frame's resolve
+        // markers as the sidecar), then ALWAYS reset below — live never latches, it renders every frame.
+        if (live_feed) {
+          std::vector<uint8_t> rbytes;
+          const uint32_t rmagic = nhl::highcut::kResolveSidecarMagic;
+          const uint32_t rcount = uint32_t(highcut_resolves_.size());
+          auto ap = [&](const void* p, size_t n) { const uint8_t* b = static_cast<const uint8_t*>(p); rbytes.insert(rbytes.end(), b, b + n); };
+          ap(&rmagic, 4); ap(&rcount, 4);
+          for (const auto& m : highcut_resolves_) ap(&m, sizeof(m));
+          HighcutLiveCommitFrame(rbytes.data(), rbytes.size());
+        }
         // The frame that just ENDED: if it was a DENSE 3D scene (enough wide+depth+indexed draws),
         // LATCH it (freeze its bins + count, ignore all later frames) — so F10 timing no longer matters;
         // the first action/close-up frame wins and a trailing sparse/menu/replay frame can't clobber it.
-        if (broadcast_guard && highcut_frame_3d_draws_ >= min_3d_draws && highcut_capture_idx_ > 0) {
+        if (!live_feed && broadcast_guard && highcut_frame_3d_draws_ >= min_3d_draws && highcut_capture_idx_ > 0) {
           highcut_captured_good_ = true;
           REXLOG_INFO("[highcut-C5] LATCHED broadcast frame ({} draws, {} 3D) — later frames ignored",
                       highcut_capture_idx_, highcut_frame_3d_draws_);
         } else {
-          if (broadcast_guard && highcut_capture_idx_ > 0)
+          if (!live_feed && broadcast_guard && highcut_capture_idx_ > 0)
             REXLOG_INFO("[highcut-C5] dropping frame ({} draws, {} 3D < {}): not a dense broadcast scene",
                         highcut_capture_idx_, highcut_frame_3d_draws_, min_3d_draws);
           // Spike/verify: log the boundary so a live-3D capture proves the guest-present hook advances
-          // (frame_index_ stays frozen under takeover) and shows the per-frame draw count.
-          REXLOG_INFO("[highcut-C5] frame boundary: present={} frame_index_={} prev_frame_draws={}",
-                      present_count, frame_index_, highcut_capture_idx_);
+          // (frame_index_ stays frozen under takeover) and shows the per-frame draw count. (Suppressed in
+          // live feed — it would fire every frame.)
+          if (!live_feed)
+            REXLOG_INFO("[highcut-C5] frame boundary: present={} frame_index_={} prev_frame_draws={}",
+                        present_count, frame_index_, highcut_capture_idx_);
           highcut_last_present_count_ = present_count;
           highcut_last_frame_index_ = frame_index_;
           highcut_capture_idx_ = 0;
@@ -2507,6 +2526,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           // C-5d.3: new frame — drop the prior frame's resolve markers and truncate the sidecar so a
           // frame with no resolves can't replay a stale list (resolves this frame re-append + rewrite).
           highcut_resolves_.clear();
+          if (!live_feed)
           if (std::FILE* rf = std::fopen("highcut_resolves.bin", "wb")) {
             const uint32_t magic = nhl::highcut::kResolveSidecarMagic, zero = 0;
             std::fwrite(&magic, 4, 1, rf);
@@ -2526,51 +2546,60 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       std::snprintf(pkt_path, sizeof(pkt_path), "highcut_p3_draw.bin");
     }
     // C-5i: once a broadcast frame is latched, stop writing — the good frame's bins + count are frozen.
-    if (!skip_capture)
-    if (std::FILE* pf = std::fopen(pkt_path, "wb")) {
-      std::fwrite(&hdr, 1, sizeof(hdr), pf);
-      std::fwrite(fetch_blob, 1, sizeof(fetch_blob), pf);
-      std::fwrite(&spv_sys, 1, sizeof(spv_sys), pf);
-      if (hdr.shared_bytes) std::fwrite(vtx_src, 1, hdr.shared_bytes, pf);
-      std::fwrite(bool_src, 1, kBoolLoopBytes, pf);
-      if (hdr.vs_float_bytes) std::fwrite(vs_floats.data(), 1, hdr.vs_float_bytes, pf);
-      if (hdr.ps_float_bytes) std::fwrite(ps_floats.data(), 1, hdr.ps_float_bytes, pf);
-      if (hdr.vs_spirv_bytes) std::fwrite(p3_vs_spirv.data(), 1, hdr.vs_spirv_bytes, pf);
-      if (hdr.ps_spirv_bytes) std::fwrite(p3_ps_spirv.data(), 1, hdr.ps_spirv_bytes, pf);
-      for (size_t i = 0; i < tex_descs.size(); ++i) {
-        std::fwrite(&tex_descs[i], 1, sizeof(tex_descs[i]), pf);
-        std::fwrite(tex_blobs[i].data(), 1, tex_blobs[i].size(), pf);
+    // C-6 LIVE FEED: build the packet bytes once (the .bin layout), then either write the file (disk
+    // capture / replay) OR hand them to the plume live-feed bridge (HighcutLivePushDraw). Live never
+    // latches (skip_capture stays false) so it pushes every frame's draws. (live_feed declared above.)
+    if (!skip_capture) {
+      std::vector<uint8_t> pkt;
+      auto app = [&](const void* p, size_t n) {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        pkt.insert(pkt.end(), b, b + n);
+      };
+      app(&hdr, sizeof(hdr));
+      app(fetch_blob, sizeof(fetch_blob));
+      app(&spv_sys, sizeof(spv_sys));
+      if (hdr.shared_bytes) app(vtx_src, hdr.shared_bytes);
+      app(bool_src, kBoolLoopBytes);
+      if (hdr.vs_float_bytes) app(vs_floats.data(), hdr.vs_float_bytes);
+      if (hdr.ps_float_bytes) app(ps_floats.data(), hdr.ps_float_bytes);
+      if (hdr.vs_spirv_bytes) app(p3_vs_spirv.data(), hdr.vs_spirv_bytes);
+      if (hdr.ps_spirv_bytes) app(p3_ps_spirv.data(), hdr.ps_spirv_bytes);
+      for (size_t i = 0; i < tex_descs.size(); ++i) { app(&tex_descs[i], sizeof(tex_descs[i])); app(tex_blobs[i].data(), tex_blobs[i].size()); }
+      for (size_t i = 0; i < vs_tex_descs.size(); ++i) { app(&vs_tex_descs[i], sizeof(vs_tex_descs[i])); app(vs_tex_blobs[i].data(), vs_tex_blobs[i].size()); }  // C-5d.3 VS (set2) after PS textures
+      for (const auto& sd : ps_samp_descs) app(&sd, sizeof(sd));  // C-5f per-sampler descs (PS then VS)
+      for (const auto& sd : vs_samp_descs) app(&sd, sizeof(sd));
+      if (hdr.index_bytes) app(index_blob.data(), hdr.index_bytes);  // C-5d, last
+
+      bool wrote = false;
+      if (live_feed) {
+        HighcutLivePushDraw(pkt.data(), pkt.size());  // C-6: accumulate into the plume thread's frame
+        wrote = true;
+      } else if (std::FILE* pf = std::fopen(pkt_path, "wb")) {
+        std::fwrite(pkt.data(), 1, pkt.size(), pf);
+        std::fclose(pf);
+        wrote = true;
+        REXLOG_INFO("[highcut-{}] dumped {}: verts={} topo={} vp=({},{},{},{}) cwm=0x{:X} "
+                    "vs_spirv={} ps_spirv={} textures={} vbinds={} shared={} blend=src{}/dst{}/op{} "
+                    "flags=0x{:X} idx(fmt={} bytes={}) depth(en={} wr={} fn={}) stencil(en={} ref={} "
+                    "rd=0x{:X} wr=0x{:X} ffn={}) cull={} ccw={}",
+                    frame_capture ? "C5" : "C4", pkt_path, hdr.vertex_count, hdr.topology, hdr.vp_x,
+                    hdr.vp_y, hdr.vp_w, hdr.vp_h, hdr.color_write_mask, hdr.vs_spirv_bytes,
+                    hdr.ps_spirv_bytes, hdr.texture_count,
+                    uint32_t(beta_current_vs_->vertex_bindings().size()), hdr.shared_bytes,
+                    hdr.blend_src, hdr.blend_dst, hdr.blend_op,
+                    spv_sys.flags, hdr.index_format, hdr.index_bytes, hdr.depth_enable, hdr.depth_write,
+                    hdr.depth_func, hdr.stencil_enable, hdr.stencil_ref, hdr.stencil_read_mask,
+                    hdr.stencil_write_mask, hdr.front_func, hdr.cull_mode, hdr.front_ccw);
       }
-      for (size_t i = 0; i < vs_tex_descs.size(); ++i) {  // C-5d.3: VS (set2) textures after PS textures
-        std::fwrite(&vs_tex_descs[i], 1, sizeof(vs_tex_descs[i]), pf);
-        std::fwrite(vs_tex_blobs[i].data(), 1, vs_tex_blobs[i].size(), pf);
-      }
-      // C-5f: per-sampler descs (PS then VS), after all textures, before the index blob.
-      for (const auto& sd : ps_samp_descs) std::fwrite(&sd, 1, sizeof(sd), pf);
-      for (const auto& sd : vs_samp_descs) std::fwrite(&sd, 1, sizeof(sd), pf);
-      if (hdr.index_bytes) std::fwrite(index_blob.data(), 1, hdr.index_bytes, pf);  // C-5d, last
-      std::fclose(pf);
-      REXLOG_INFO("[highcut-{}] dumped {}: verts={} topo={} vp=({},{},{},{}) cwm=0x{:X} "
-                  "vs_spirv={} ps_spirv={} textures={} vbinds={} shared={} blend=src{}/dst{}/op{} "
-                  "flags=0x{:X} idx(fmt={} bytes={}) depth(en={} wr={} fn={}) stencil(en={} ref={} "
-                  "rd=0x{:X} wr=0x{:X} ffn={}) cull={} ccw={}",
-                  frame_capture ? "C5" : "C4", pkt_path, hdr.vertex_count, hdr.topology, hdr.vp_x,
-                  hdr.vp_y, hdr.vp_w, hdr.vp_h, hdr.color_write_mask, hdr.vs_spirv_bytes,
-                  hdr.ps_spirv_bytes, hdr.texture_count,
-                  uint32_t(beta_current_vs_->vertex_bindings().size()), hdr.shared_bytes,
-                  hdr.blend_src, hdr.blend_dst, hdr.blend_op,
-                  spv_sys.flags, hdr.index_format, hdr.index_bytes, hdr.depth_enable, hdr.depth_write,
-                  hdr.depth_func, hdr.stencil_enable, hdr.stencil_ref, hdr.stencil_read_mask,
-                  hdr.stencil_write_mask, hdr.front_func, hdr.cull_mode, hdr.front_ccw);
-      if (frame_capture) {
-        ++highcut_capture_idx_;
-        // Rewrite the running count after EVERY dumped draw — the captured frame must be replayable
-        // even if the live-3D IssueSwap never completes (deadlock / mid-frame kill). The plume replay
-        // loads exactly this many highcut_frame_<N>.bin; stale higher-index bins from a longer prior
-        // frame are ignored.
-        if (std::FILE* cf = std::fopen("highcut_frame.count", "w")) {
-          std::fprintf(cf, "%u\n", highcut_capture_idx_);
-          std::fclose(cf);
+      if (wrote && frame_capture) {
+        ++highcut_capture_idx_;  // per-frame draw index (resolve markers' after_draw; live push order)
+        // Disk replay needs the running count file (replayable even if IssueSwap never completes); live
+        // uses the bridge's commit instead, so skip the file.
+        if (!live_feed) {
+          if (std::FILE* cf = std::fopen("highcut_frame.count", "w")) {
+            std::fprintf(cf, "%u\n", highcut_capture_idx_);
+            std::fclose(cf);
+          }
         }
       }
     }
