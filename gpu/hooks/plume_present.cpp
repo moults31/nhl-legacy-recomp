@@ -1286,14 +1286,18 @@ void LoadC5Frames(PlumeCtx& c) {
     // surface's offscreen RT (sized to that surface) and re-point the draw's set3 slot at the source
     // RT's sampleable color/depth view. The render loop renders these source surfaces before the
     // primary pass and barriers them to SHADER_READ, so the consumer samples our rendered content.
-    // Gated NHL_HIGHCUT_C5_COMPOSITE (opt-in): off => the known-good primary-only path is unchanged.
-    // NHL_HIGHCUT_C5_COMPOSITE: unset=off; "depth"=only depth (shadow) rebinds; "color"=only color
-    // (reflection/RTT) rebinds; any other value (e.g. "1")=both. The depth/color split isolates which
-    // resolve class causes an artifact (depth→self-shadow, color→reflections).
+    // C-5m: DEFAULT ON in "depth" mode. The host-copy re-points only genuinely-STUBBED bindings (see
+    // BuildRenderableDraw `capturedStub`); since readback-resolve (C-5l) made the COLOR resolves sample
+    // real guest RAM, the only stubbed resolve-dest bindings left are the k_24_8 DEPTH/shadow maps. So
+    // the default re-points the goalie's shadow-map samples at the rendered shadow surface -> real self-
+    // shadowing, verified (66 depth rebinds, 0 color, 0 Vulkan errors, no ice/jersey regression).
+    // Opt out fully with NHL_HIGHCUT_NO_COMPOSITE. NHL_HIGHCUT_C5_COMPOSITE still OVERRIDES the mode for
+    // diagnostics: "depth"=only depth, "color"=only color (reflection/RTT), any other value=both.
+    if (std::getenv("NHL_HIGHCUT_NO_COMPOSITE")) return;
     const char* compEnv = std::getenv("NHL_HIGHCUT_C5_COMPOSITE");
-    if (!compEnv) return;
-    const bool wantDepth = std::strcmp(compEnv, "color") != 0;
-    const bool wantColor = std::strcmp(compEnv, "depth") != 0;
+    const char* mode = compEnv ? compEnv : "depth";  // default-on = depth-only
+    const bool wantDepth = std::strcmp(mode, "color") != 0;
+    const bool wantColor = std::strcmp(mode, "depth") != 0;
     uint32_t reboundColor = 0, reboundDepth = 0, deferred = 0, skippedClass = 0;
     std::unordered_set<uint64_t> sampledSeen;
     for (auto& d : c.c5draws) {
@@ -1316,7 +1320,7 @@ void LoadC5Frames(PlumeCtx& c) {
         }
     }
     REXLOG_INFO("[highcut-C5d3] composite mode='{}': {} source surfaces; re-pointed {} color + {} depth "
-                "bindings ({} deferred primary-source/HUD, {} skipped by mode)", compEnv,
+                "bindings ({} deferred primary-source/HUD, {} skipped by mode)", mode,
                 uint32_t(c.sampledSrcOrder.size()), reboundColor, reboundDepth, deferred, skippedClass);
 }
 
@@ -1696,10 +1700,11 @@ void RenderClear(PlumeCtx& c) {
         // into its own correctly-sized offscreen RT, then barrier it to SHADER_READ. The primary draws
         // that sample its resolve dest were re-pointed (at load) at this RT's color/depth view, so they
         // now read our rendered content. Render order = first-seen sampling order; each source surface
-        // is a full pass (own viewport+clear). Gated NHL_HIGHCUT_C5_COMPOSITE; needs -Full (the source
-        // surface's own draws must replay, so don't isolate a single consumer draw). The HUD / self-
-        // sampling case (source == primary) is deferred and handled in the HUD step.
-        static const bool composite = std::getenv("NHL_HIGHCUT_C5_COMPOSITE") != nullptr;
+        // is a full pass (own viewport+clear). C-5m: DEFAULT ON (opt out NHL_HIGHCUT_NO_COMPOSITE) —
+        // matches the load-time re-point gate. Needs the full draw range (the source surface's own draws
+        // must replay), so a single-draw isolation (-Draw) skips it. The HUD / self-sampling case
+        // (source == primary) is deferred and handled in the HUD step.
+        static const bool composite = std::getenv("NHL_HIGHCUT_NO_COMPOSITE") == nullptr;
         if (composite && !c.sampledSrcOrder.empty()) {
             for (uint64_t k : c.sampledSrcOrder) {
                 PlumeCtx::SurfaceRT* s = GetOrCreateSurfaceRT(c, k);  // created at load with guest dims
