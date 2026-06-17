@@ -20,6 +20,19 @@ REXCVAR_DECLARE(int32_t, draw_resolution_scale_x);
 REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 REXCVAR_DECLARE(bool, vsync);
 
+// NHL Legacy color-grade post-process cvars (defined in the SDK Vulkan command
+// processor; applied in place on the guest-output image right after the swap
+// gamma-apply). All hot-reloadable, so slider edits take effect on the next
+// present. Defaults are identity, so the pass is a no-op until enabled.
+REXCVAR_DECLARE(bool, present_grade_enable);
+REXCVAR_DECLARE(double, present_grade_exposure);
+REXCVAR_DECLARE(double, present_grade_contrast);
+REXCVAR_DECLARE(double, present_grade_saturation);
+REXCVAR_DECLARE(double, present_grade_brightness);
+REXCVAR_DECLARE(double, present_grade_temperature);
+REXCVAR_DECLARE(double, present_grade_tint);
+REXCVAR_DECLARE(double, present_grade_tonemap);
+
 // AMD FidelityFX present-time scaler cvars (UI/Presenter). These only exist when
 // the SDK is built with REXGLUE_ENABLE_FIDELITYFX=ON — the same switch that
 // defines REX_HAS_FIDELITYFX_SDK (exported as an interface compile-def), so this
@@ -262,10 +275,74 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
     }
 #endif
 
-    // --- Lighting (placeholder) ---
-    if (ImGui::CollapsingHeader("Lighting")) {
-      ImGui::TextDisabled("Exposure / tone-map knobs need an SDK exposure");
-      ImGui::TextDisabled("uniform on the fsi shader path (follow-up).");
+    // --- Lighting / Color Grade ---
+    // Drives the SDK present_grade_* cvars (an in-place compute pass after the
+    // swap gamma-apply). Hot-reloadable: edits take effect on the next present.
+    // Each control persists so the look survives a relaunch (OnPreSetup re-applies
+    // it). The whole pass is identity until "Enable color grade" is ticked.
+    if (ImGui::CollapsingHeader("Lighting / Color Grade", ImGuiTreeNodeFlags_DefaultOpen)) {
+      bool grade_on = REXCVAR_GET(present_grade_enable);
+      if (ImGui::Checkbox("Enable color grade", &grade_on)) {
+        REXCVAR_SET(present_grade_enable, grade_on);
+        nhl::SaveGradeEnable(grade_on);
+      }
+
+      ImGui::BeginDisabled(!grade_on);
+
+      auto grade_slider = [&](const char* label, const char* fmt, float lo, float hi,
+                              double (*getter)(), void (*setter)(double),
+                              void (*saver)(double)) {
+        float v = static_cast<float>(getter());
+        if (ImGui::SliderFloat(label, &v, lo, hi, fmt)) {
+          setter(double(v));
+          saver(double(v));
+        }
+      };
+
+      grade_slider(
+          "Exposure (EV)", "%.2f", -2.0f, 2.0f, [] { return REXCVAR_GET(present_grade_exposure); },
+          [](double v) { REXCVAR_SET(present_grade_exposure, v); }, &nhl::SaveGradeExposure);
+      grade_slider(
+          "Contrast", "%.2f", 0.5f, 1.5f, [] { return REXCVAR_GET(present_grade_contrast); },
+          [](double v) { REXCVAR_SET(present_grade_contrast, v); }, &nhl::SaveGradeContrast);
+      grade_slider(
+          "Saturation", "%.2f", 0.0f, 2.0f, [] { return REXCVAR_GET(present_grade_saturation); },
+          [](double v) { REXCVAR_SET(present_grade_saturation, v); }, &nhl::SaveGradeSaturation);
+      grade_slider(
+          "Brightness", "%.2f", -0.25f, 0.25f,
+          [] { return REXCVAR_GET(present_grade_brightness); },
+          [](double v) { REXCVAR_SET(present_grade_brightness, v); }, &nhl::SaveGradeBrightness);
+      grade_slider(
+          "Temperature (warm+)", "%.2f", -1.0f, 1.0f,
+          [] { return REXCVAR_GET(present_grade_temperature); },
+          [](double v) { REXCVAR_SET(present_grade_temperature, v); },
+          &nhl::SaveGradeTemperature);
+      grade_slider(
+          "Tint (green+)", "%.2f", -1.0f, 1.0f, [] { return REXCVAR_GET(present_grade_tint); },
+          [](double v) { REXCVAR_SET(present_grade_tint, v); }, &nhl::SaveGradeTint);
+      grade_slider(
+          "Filmic tone-map", "%.2f", 0.0f, 1.0f,
+          [] { return REXCVAR_GET(present_grade_tonemap); },
+          [](double v) { REXCVAR_SET(present_grade_tonemap, v); }, &nhl::SaveGradeTonemap);
+
+      if (ImGui::Button("Reset grade to neutral")) {
+        REXCVAR_SET(present_grade_exposure, 0.0);
+        nhl::SaveGradeExposure(0.0);
+        REXCVAR_SET(present_grade_contrast, 1.0);
+        nhl::SaveGradeContrast(1.0);
+        REXCVAR_SET(present_grade_saturation, 1.0);
+        nhl::SaveGradeSaturation(1.0);
+        REXCVAR_SET(present_grade_brightness, 0.0);
+        nhl::SaveGradeBrightness(0.0);
+        REXCVAR_SET(present_grade_temperature, 0.0);
+        nhl::SaveGradeTemperature(0.0);
+        REXCVAR_SET(present_grade_tint, 0.0);
+        nhl::SaveGradeTint(0.0);
+        REXCVAR_SET(present_grade_tonemap, 0.0);
+        nhl::SaveGradeTonemap(0.0);
+      }
+
+      ImGui::EndDisabled();
     }
 
     // --- Engine Tunables (live World-B constants) ---

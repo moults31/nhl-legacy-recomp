@@ -132,4 +132,30 @@ inline void SaveFfxFsrSharpness(double v) {
   SaveSetting("ffx_fsr_sharpness", std::to_string(v));
 }
 
+// Color-grade post-process (SDK present_grade_* cvars). Hot-reloadable, but
+// persisted so the overlay's look survives a relaunch (re-applied in OnPreSetup).
+inline bool LoadGradeEnable(bool fallback) { return LoadBool("grade_enable", fallback); }
+inline void SaveGradeEnable(bool v) { SaveSetting("grade_enable", v ? "1" : "0"); }
+
+inline double LoadGradeExposure(double f) { return LoadDouble("grade_exposure", f); }
+inline void SaveGradeExposure(double v) { SaveSetting("grade_exposure", std::to_string(v)); }
+
+inline double LoadGradeContrast(double f) { return LoadDouble("grade_contrast", f); }
+inline void SaveGradeContrast(double v) { SaveSetting("grade_contrast", std::to_string(v)); }
+
+inline double LoadGradeSaturation(double f) { return LoadDouble("grade_saturation", f); }
+inline void SaveGradeSaturation(double v) { SaveSetting("grade_saturation", std::to_string(v)); }
+
+inline double LoadGradeBrightness(double f) { return LoadDouble("grade_brightness", f); }
+inline void SaveGradeBrightness(double v) { SaveSetting("grade_brightness", std::to_string(v)); }
+
+inline double LoadGradeTemperature(double f) { return LoadDouble("grade_temperature", f); }
+inline void SaveGradeTemperature(double v) { SaveSetting("grade_temperature", std::to_string(v)); }
+
+inline double LoadGradeTint(double f) { return LoadDouble("grade_tint", f); }
+inline void SaveGradeTint(double v) { SaveSetting("grade_tint", std::to_string(v)); }
+
+inline double LoadGradeTonemap(double f) { return LoadDouble("grade_tonemap", f); }
+inline void SaveGradeTonemap(double v) { SaveSetting("grade_tonemap", std::to_string(v)); }
+
 }  // namespace nhl

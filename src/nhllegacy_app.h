@@ -102,6 +102,16 @@ REXCVAR_DECLARE(double, present_cas_additional_sharpness);
 REXCVAR_DECLARE(double, present_fsr_sharpness_reduction);
 #endif
 
+// NHL Legacy color-grade post-process cvars (SDK Vulkan command processor).
+REXCVAR_DECLARE(bool, present_grade_enable);
+REXCVAR_DECLARE(double, present_grade_exposure);
+REXCVAR_DECLARE(double, present_grade_contrast);
+REXCVAR_DECLARE(double, present_grade_saturation);
+REXCVAR_DECLARE(double, present_grade_brightness);
+REXCVAR_DECLARE(double, present_grade_temperature);
+REXCVAR_DECLARE(double, present_grade_tint);
+REXCVAR_DECLARE(double, present_grade_tonemap);
+
 // Win32 process-exit primitives (declared directly to avoid pulling <windows.h>
 // into this widely-included header). Used only by the replay-mode fast-exit.
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentProcess();
@@ -280,6 +290,20 @@ class NhllegacyApp : public rex::ReXApp {
         }
       }
 #endif
+
+      // Color-grade post-process. Hot-reloadable, but the persisted overlay look
+      // is applied here so it's live from the first frame. No-op unless enabled.
+      if (nhl::LoadGradeEnable(/*fallback=*/false)) {
+        REXCVAR_SET(present_grade_enable, true);
+        REXCVAR_SET(present_grade_exposure, nhl::LoadGradeExposure(0.0));
+        REXCVAR_SET(present_grade_contrast, nhl::LoadGradeContrast(1.0));
+        REXCVAR_SET(present_grade_saturation, nhl::LoadGradeSaturation(1.0));
+        REXCVAR_SET(present_grade_brightness, nhl::LoadGradeBrightness(0.0));
+        REXCVAR_SET(present_grade_temperature, nhl::LoadGradeTemperature(0.0));
+        REXCVAR_SET(present_grade_tint, nhl::LoadGradeTint(0.0));
+        REXCVAR_SET(present_grade_tonemap, nhl::LoadGradeTonemap(0.0));
+        REXLOG_INFO("[nhl-vk-grade] color grade enabled from persisted settings");
+      }
     }
 #endif
     // Opt-in D3D12 debug layer (NHL_BETA_D3D12_DEBUG): must be set before the
