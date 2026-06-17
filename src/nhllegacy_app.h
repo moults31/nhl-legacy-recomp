@@ -49,6 +49,9 @@
 #include "tools/replay/src/image_dump.h"
 #include "tools/replay/src/xtr_player.h"
 #include "overall_weights_dump.h"
+#include "stick_list_scan.h"
+#include "tunable_registry_dump.h"
+#include "tunable_runtime.h"
 #include "union_device.h"
 
 // Runtime cvar (defined in rexruntime): when true, guest page 0 is
@@ -84,6 +87,20 @@ REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 // these may be ignored by 0.8.0 - verified at runtime.
 REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
+
+// SDK display cvars (UI/Window): borderless-fullscreen start + monitor index.
+// Both are restart-required (read during SetupPresentation), so the overlay's
+// persisted choices are applied here in OnPreSetup.
+REXCVAR_DECLARE(bool, fullscreen);
+REXCVAR_DECLARE(int32_t, monitor);
+
+// AMD FidelityFX present-time scaler cvars (UI/Presenter) — only defined when the
+// SDK is built with REXGLUE_ENABLE_FIDELITYFX=ON (which also defines this guard).
+#if defined(REX_HAS_FIDELITYFX_SDK)
+REXCVAR_DECLARE(std::string, present_effect);
+REXCVAR_DECLARE(double, present_cas_additional_sharpness);
+REXCVAR_DECLARE(double, present_fsr_sharpness_reduction);
+#endif
 
 // Win32 process-exit primitives (declared directly to avoid pulling <windows.h>
 // into this widely-included header). Used only by the replay-mode fast-exit.
@@ -197,6 +214,32 @@ class NhllegacyApp : public rex::ReXApp {
     REXCVAR_SET(draw_resolution_scale_y, 1);
     REXCVAR_SET(window_width, 1920);
     REXCVAR_SET(window_height, 1080);
+
+    // Display mode + monitor: apply the persisted overlay choices (and optional
+    // dev env overrides) at launch. Both SDK cvars are read once during
+    // SetupPresentation, so they must be set before the window is created here.
+    {
+      bool start_fullscreen = nhl::LoadFullscreen(/*fallback=*/false);
+      if (const char* e = std::getenv("NHL_VK_FULLSCREEN"); e && *e) {
+        start_fullscreen = (*e != '0');
+      }
+      if (start_fullscreen) {
+        REXCVAR_SET(fullscreen, true);
+        REXLOG_INFO("[nhl-display] starting in borderless fullscreen");
+      }
+      int32_t mon = nhl::LoadMonitor(/*fallback=*/0);
+      if (const char* e = std::getenv("NHL_VK_MONITOR"); e && *e) {
+        mon = int32_t(std::strtol(e, nullptr, 10));
+      }
+      if (mon > 0) {
+        REXCVAR_SET(monitor, mon);
+        REXLOG_INFO("[nhl-display] target monitor index {}", mon);
+      }
+
+      // V-Sync: restart-required SDK cvar. Apply the persisted overlay choice;
+      // an absent key leaves the SDK default (true) untouched.
+      REXCVAR_SET(vsync, nhl::LoadVsync(REXCVAR_GET(vsync)));
+    }
 #ifdef NHL_HAVE_VULKAN_BACKEND
     // Enhancement A (docs/vulkan-enhancements-kickoff-prompt.md §3.A): internal-
     // resolution supersampling. The SDK renders the guest 1280x720 internally and
@@ -220,6 +263,23 @@ class NhllegacyApp : public rex::ReXApp {
                     "(internal {}x{})",
                     scale, 1280 * scale, 720 * scale);
       }
+
+      // FidelityFX present-time scaler (FSR/CAS). Only present when the SDK was
+      // built with REXGLUE_ENABLE_FIDELITYFX=ON; the cvars are restart-required,
+      // so apply the persisted overlay choices here before SetupPresentation.
+#if defined(REX_HAS_FIDELITYFX_SDK)
+      {
+        const std::string effect = nhl::LoadFfxEffect(/*fallback=*/"bilinear");
+        if (effect != "bilinear") {
+          REXCVAR_SET(present_effect, effect);
+          REXCVAR_SET(present_cas_additional_sharpness,
+                      nhl::LoadFfxCasSharpness(REXCVAR_GET(present_cas_additional_sharpness)));
+          REXCVAR_SET(present_fsr_sharpness_reduction,
+                      nhl::LoadFfxFsrSharpness(REXCVAR_GET(present_fsr_sharpness_reduction)));
+          REXLOG_INFO("[nhl-vk-ffx] present effect '{}'", effect);
+        }
+      }
+#endif
     }
 #endif
     // Opt-in D3D12 debug layer (NHL_BETA_D3D12_DEBUG): must be set before the
@@ -393,6 +453,22 @@ class NhllegacyApp : public rex::ReXApp {
       return nhl::ui::PerfSnapshot{s.fps, s.frame_ms, s.draws_per_frame,
                                    s.frames_total, s.valid};
     };
+    // Live display-mode toggle. SetFullscreen does SetWindowLong/SetWindowPos,
+    // which must run on the UI (message) thread — marshal via the app context.
+    // Also persist so the choice survives a restart (the `fullscreen` cvar is
+    // only read at window open).
+    auto set_fullscreen = [this](bool fs) {
+      app_context().CallInUIThreadDeferred([this, fs]() {
+        if (auto* w = window()) {
+          w->SetFullscreen(fs);
+        }
+      });
+      nhl::SaveFullscreen(fs);
+    };
+    auto is_fullscreen = [this]() -> bool {
+      auto* w = window();
+      return w && w->IsFullscreen();
+    };
     auto on_exit = []() {
       // The recomp's normal app/kernel/GPU teardown (QuitFromUIThread -> OnDestroy,
       // which joins the still-running guest thread) HANGS when torn down mid-guest-
@@ -405,8 +481,58 @@ class NhllegacyApp : public rex::ReXApp {
       rex::ShutdownLogging();
       ::TerminateProcess(::GetCurrentProcess(), 0u);
     };
+    // Live engine-tunable store (World B). Built lazily on a worker thread when
+    // the overlay's "Engine Tunables" section is first opened (the scan is only
+    // valid post tweak-registration). The guest memory base is resolved by this
+    // provider AT BUILD TIME, not now — OnCreateDialogs runs before the guest
+    // memory subsystem is initialized, so touching it here would crash.
+    {
+      auto vbase_provider = [this]() -> const uint8_t* {
+        auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+        return (gs && gs->memory())
+                   ? gs->memory()->TranslateVirtual<const uint8_t*>(0u)
+                   : nullptr;
+      };
+      tunable_store_ =
+          std::make_unique<nhllegacy::TunableRuntimeStore>(std::move(vbase_provider));
+      // If nhl_tunables.json already has saved overrides, kick the build after a
+      // registration delay so they re-apply even if the overlay is never opened.
+      if (std::filesystem::exists(nhllegacy::TunablesOverridePath())) {
+        unsigned delay_ms = 12000;
+        if (const char* d = std::getenv("NHL_DUMP_DELAY_MS"); d && *d)
+          delay_ms = static_cast<unsigned>(strtoul(d, nullptr, 0));
+        auto* store = tunable_store_.get();
+        std::thread([store, delay_ms]() {
+          ::Sleep(delay_ms);
+          store->RequestBuild();  // applies persisted overrides on completion
+        }).detach();
+      }
+    }
+    // Developer Tools: scan live guest memory for the create-player stick-picker
+    // list (docs/.../editplayer-equipment-enumeration.md). Resolves the guest
+    // membase at click time (the guest is running by then) and runs the scan on a
+    // detached thread so the present loop never stalls. Writes next to the exe.
+    auto dev_scan_stick_list = [this]() {
+      auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+      const uint8_t* vbase =
+          (gs && gs->memory()) ? gs->memory()->TranslateVirtual<const uint8_t*>(0u)
+                               : nullptr;
+      if (!vbase) {
+        REXLOG_WARN("[stick-scan] no guest memory available");
+        return;
+      }
+      const std::string out =
+          (rex::filesystem::GetExecutableFolder() / "stick_list_scan.txt").string();
+      std::thread([vbase, out]() {
+        REXLOG_INFO("[stick-scan] scanning guest memory -> {}", out);
+        nhllegacy::ScanStickList(vbase, out.c_str());
+        REXLOG_INFO("[stick-scan] done -> {}", out);
+      }).detach();
+    };
     enh_overlay_ = std::make_unique<nhl::ui::NhlEnhancementsDialog>(
-        drawer, std::move(poll_pad), std::move(perf), std::move(on_exit));
+        drawer, std::move(poll_pad), std::move(perf), std::move(on_exit),
+        std::move(set_fullscreen), std::move(is_fullscreen), tunable_store_.get(),
+        std::move(dev_scan_stick_list));
     REXLOG_INFO("[nhl-vk] enhancements overlay ready (Guide/PS button or F1 to toggle)");
   }
 #endif
@@ -471,6 +597,36 @@ class NhllegacyApp : public rex::ReXApp {
       return;
     }
 
+    // NHL_DUMP_IMAGE: write the decompressed guest image (.rodata/.data/.text,
+    // mapped by Setup at 0x82000000) to a raw file, then fast-exit without
+    // launching the guest. Lets static tables compiled into the binary (e.g. the
+    // create-player equipment picker's fixed stick-ID list) be located offline by
+    // scanning the dump, instead of grepping the LZX-compressed default.xex (which
+    // finds nothing). Same fast-exit discipline as NHL_DUMP_OVERALL_WEIGHTS below.
+    if (const char* di = std::getenv("NHL_DUMP_IMAGE"); di && *di) {
+      auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+      if (gs && gs->memory()) {
+        constexpr uint32_t kImageBase = 0x82000000u;
+        constexpr uint32_t kImageSize = 0x1EA0000u;
+        const uint8_t* img =
+            gs->memory()->TranslateVirtual<const uint8_t*>(kImageBase);
+        const std::string out =
+            (rex::filesystem::GetExecutableFolder() / "guest_image_dump.bin").string();
+        if (std::FILE* f = std::fopen(out.c_str(), "wb")) {
+          std::fwrite(img, 1, kImageSize, f);
+          std::fclose(f);
+          std::fprintf(stderr, "[img-dump] wrote %u bytes @ %08X -> %s\n",
+                       kImageSize, kImageBase, out.c_str());
+        } else {
+          std::fprintf(stderr, "[img-dump] failed to open %s\n", out.c_str());
+        }
+      } else {
+        std::fprintf(stderr, "[img-dump] no graphics/memory system available\n");
+      }
+      rex::ShutdownLogging();
+      ::TerminateProcess(::GetCurrentProcess(), 0u);
+    }
+
     if (const char* dump = std::getenv("NHL_DUMP_OVERALL_WEIGHTS"); dump && *dump) {
       auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
       if (gs && gs->memory()) {
@@ -487,6 +643,66 @@ class NhllegacyApp : public rex::ReXApp {
       }
       rex::ShutdownLogging();
       ::TerminateProcess(::GetCurrentProcess(), 0u);
+    }
+
+    // NHL_DUMP_TUNABLES: enumerate the engine tweak-registration pool(s) from
+    // the mapped image (tunable_registry_dump.h) and fast-exit. Produces the
+    // full gXxx tunable catalog — physics / skating / collision / animation /
+    // AI / fighting / goalie / rules — by category + name, with any inline
+    // defaults. Writes tunable_registry.txt + tunable_registry.json next to the
+    // exe. This is the static name catalog; live values come from the RUNTIME
+    // variant below (defaults are sparse in the pool, resolved at registration).
+    if (const char* dump = std::getenv("NHL_DUMP_TUNABLES"); dump && *dump) {
+      auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+      if (gs && gs->memory()) {
+        constexpr uint32_t kImageBase = 0x82000000u;
+        constexpr uint32_t kImageSize = 0x1EA0000u;
+        const uint8_t* img =
+            gs->memory()->TranslateVirtual<const uint8_t*>(kImageBase);
+        const auto folder = rex::filesystem::GetExecutableFolder();
+        const std::string txt = (folder / "tunable_registry.txt").string();
+        const std::string json = (folder / "tunable_registry.json").string();
+        nhllegacy::DumpTunableRegistry(img, kImageBase, kImageSize, txt.c_str(),
+                                       json.c_str());
+      } else {
+        std::fprintf(stderr, "[tunables] no graphics/memory system available\n");
+      }
+      rex::ShutdownLogging();
+      ::TerminateProcess(::GetCurrentProcess(), 0u);
+    }
+
+    // NHL_DUMP_TUNABLES_RUNTIME: let the guest boot so its tweak registration
+    // runs, then scan committed guest memory for the now-materialised
+    // name->value records and record each tunable's live value. Writes
+    // tunable_values_runtime.txt + .json. NHL_DUMP_DELAY_MS overrides the wait.
+    if (const char* rt = std::getenv("NHL_DUMP_TUNABLES_RUNTIME"); rt && *rt) {
+      auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+      const uint8_t* vbase =
+          (gs && gs->memory()) ? gs->memory()->TranslateVirtual<const uint8_t*>(0u)
+                               : nullptr;
+      unsigned delay_ms = 12000;
+      if (const char* d = std::getenv("NHL_DUMP_DELAY_MS"); d && *d) {
+        delay_ms = static_cast<unsigned>(strtoul(d, nullptr, 0));
+      }
+      const auto folder = rex::filesystem::GetExecutableFolder();
+      const std::string txt = (folder / "tunable_values_runtime.txt").string();
+      const std::string json = (folder / "tunable_values_runtime.json").string();
+      const std::string catalog = (folder / "tunables_catalog.json").string();
+      if (vbase) {
+        std::thread([vbase, txt, json, catalog, delay_ms]() {
+          std::fprintf(stderr, "[tunables-rt] waiting %u ms for tweak registration...\n",
+                       delay_ms);
+          ::Sleep(delay_ms);
+          nhllegacy::DumpTunableValuesRuntime(vbase, txt.c_str(), json.c_str(),
+                                              catalog.c_str());
+          rex::ShutdownLogging();
+          ::TerminateProcess(::GetCurrentProcess(), 0u);
+        }).detach();
+      } else {
+        std::fprintf(stderr, "[tunables-rt] no memory base; cannot scan\n");
+      }
+      rex::ReXApp::LaunchModule();
+      return;
     }
 
     const char* xtr = std::getenv("NHL_REPLAY_XTR");
@@ -613,6 +829,10 @@ class NhllegacyApp : public rex::ReXApp {
 
   std::thread replay_thread_;
 #ifdef NHL_HAVE_VULKAN_BACKEND
+  // Live engine-tunable store backing the overlay's "Engine Tunables" section.
+  // Declared BEFORE the dialog so it is destroyed AFTER it (members destruct in
+  // reverse declaration order) — the dialog holds a raw pointer into it.
+  std::unique_ptr<nhllegacy::TunableRuntimeStore> tunable_store_;
   // In-game enhancements overlay (created in OnCreateDialogs under NHL_VK_BACKEND,
   // destroyed in OnShutdown before the SDK tears down the ImGui drawer).
   std::unique_ptr<nhl::ui::NhlEnhancementsDialog> enh_overlay_;

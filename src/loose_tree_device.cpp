@@ -153,6 +153,18 @@ class LooseTreeEntry final : public fs::Entry {
       *out_file = new HostFile(desired_access, this, host_);
       return X_STATUS_SUCCESS;
     }
+    // Diagnostic (NHL_LOG_ASSET_OPENS): log every loose asset the guest opens by
+    // its logical cache: path + size. Used to observe which assets a frontend
+    // picker actually enumerates -- e.g. walking the Create/Edit Player stick
+    // picker emits one open per requested fe\ion\artassets\createplayer\sticks\
+    // stickN.big, so the set of N logged == the selectable catalog. Grep the log
+    // for the asset family of interest (createplayer\sticks, \brands, ...).
+    // Env-gated (checked once); the default path logs nothing.
+    static const bool log_asset_opens =
+        std::getenv("NHL_LOG_ASSET_OPENS") != nullptr;
+    if (log_asset_opens) {
+      REXLOG_INFO("[asset-open] {} ({} bytes)", path(), size_);
+    }
     // TEMP diagnostic: log .db opens so we can see which databases the game
     // loads (and when) and confirm a grown DB is served. Remove after testing.
     if (EndsWithCi(name_, ".db")) {
