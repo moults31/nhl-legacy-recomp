@@ -17,9 +17,12 @@ if "%1"=="configure" (
     -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O3 -DNDEBUG -march=native -fprofile-use=%PROFDATA% -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date" ^
     -DCMAKE_PREFIX_PATH=%VKSDK% ^
     -DNHLLEGACY_VULKAN_BACKEND=ON ^
-    -DNHLLEGACY_BUILD_PACKAGER=OFF -DNHLLEGACY_BUILD_TRACE_TOOLS=OFF
+    -DNHLLEGACY_BUILD_PACKAGER=ON -DNHLLEGACY_BUILD_TRACE_TOOLS=OFF
   echo CONFIGURE_EXIT=%ERRORLEVEL%
 ) else (
+  REM Build both the port and the installer so they link the SAME Vulkan runtime
+  REM DLL (the ThinLTO rexruntimerd.dll), required for the Vulkan-primary release.
   cmake --build %BDIR% --target nhllegacy
+  cmake --build %BDIR% --target nhl-legacy-builder
   echo BUILD_EXIT=%ERRORLEVEL%
 )

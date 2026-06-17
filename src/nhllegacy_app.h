@@ -113,6 +113,15 @@ class NhllegacyApp : public rex::ReXApp {
     // just before calling this hook; replace it with our subclass, which reuses
     // the SDK guest-GPU front-end and (for now) logs-and-delegates every draw.
 #ifdef NHL_HAVE_VULKAN_BACKEND
+    // Vulkan is the PRIMARY backend in this build — default it ON so end users get
+    // the optimized Vulkan path (and the enhancements overlay) without setting any
+    // env vars. NHL_VK_BACKEND_OFF=1 forces the legacy D3D12 path as a fallback for
+    // GPUs lacking fragment-shader-interlock (the fsi path the in-game 3D needs).
+    if (!std::getenv("NHL_VK_BACKEND") && !std::getenv("NHL_VK_BACKEND_OFF")) {
+      _putenv_s("NHL_VK_BACKEND", "1");
+    }
+#endif
+#ifdef NHL_HAVE_VULKAN_BACKEND
     // SPIKE: opt-in env gate to drive the SDK's native Vulkan ROV/EDRAM backend
     // instead of our D3D12 subclass. Phase A is the stock backend (no subclass) —
     // does the recomp boot→menu→gameplay on Vulkan, and how fast? Default (unset)

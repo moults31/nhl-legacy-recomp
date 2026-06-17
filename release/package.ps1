@@ -19,20 +19,23 @@ param(
     [string]$TestInput = "",         # ISO or extracted folder for the post-zip self-check
     [string]$OutDir    = "",
     [string]$StudioDir = "E:\Repositories\nhl-database-studio",  # for the .big/texture extractor
-    [switch]$NoExtractor             # skip bundling the .big extractor (smaller payload)
+    [switch]$NoExtractor,            # skip bundling the .big extractor (smaller payload)
+    [switch]$SkipBuild,              # package a PREBUILT dir (e.g. the Vulkan PGO build) as-is
+    [string]$BuildDirOverride = ""   # use this build dir instead of out\build\<Preset>
 )
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $OutDir) { $OutDir = Join-Path $RepoRoot "out\release" }
 $BuildDir = Join-Path $RepoRoot "out\build\$Preset"
+if ($BuildDirOverride) { $BuildDir = $BuildDirOverride }
 
 # Runtime DLL flavor suffix follows the preset. relwithdebinfo ("rd") is the
 # only flavor that has been play-tested; switch to release only after a full
-# smoke pass.
-if ($Preset -like "*relwithdebinfo") { $Flavor = "rd" }
-elseif ($Preset -like "*release")    { $Flavor = "" }
-elseif ($Preset -like "*debug")      { $Flavor = "d" }
+# smoke pass. The Vulkan builds (win-amd64-vk*) use a RelWithDebInfo base -> "rd".
+if ($Preset -like "*release")              { $Flavor = "" }
+elseif ($Preset -like "*debug")            { $Flavor = "d" }
+elseif ($Preset -like "*relwithdebinfo" -or $Preset -like "*vk*") { $Flavor = "rd" }
 else { throw "Unrecognized preset '$Preset'" }
 
 function Step([string]$Name) {
@@ -57,16 +60,22 @@ if ($RunCodegen) {
 }
 
 # --- 2. Configure + build the port and the packager ---
-Step "Configure ($Preset)"
-$SdkDirFwd = $SdkDir -replace '\\', '/'
-cmake --preset $Preset "-DCMAKE_PREFIX_PATH=$SdkDirFwd"
-CheckExit "cmake configure"
+# With -SkipBuild we package an already-built dir as-is (e.g. the Vulkan PGO build
+# produced by _build_vk_pgo.bat, which presets/cmake --preset don't cover).
+if (-not $SkipBuild) {
+    Step "Configure ($Preset)"
+    $SdkDirFwd = $SdkDir -replace '\\', '/'
+    cmake --preset $Preset "-DCMAKE_PREFIX_PATH=$SdkDirFwd"
+    CheckExit "cmake configure"
 
-Step "Build nhllegacy + nhl-legacy-builder"
-cmake --build --preset $Preset --target nhllegacy
-CheckExit "build nhllegacy"
-cmake --build --preset $Preset --target nhl-legacy-builder
-CheckExit "build nhl-legacy-builder"
+    Step "Build nhllegacy + nhl-legacy-builder"
+    cmake --build --preset $Preset --target nhllegacy
+    CheckExit "build nhllegacy"
+    cmake --build --preset $Preset --target nhl-legacy-builder
+    CheckExit "build nhl-legacy-builder"
+} else {
+    Step "Skipping build (packaging prebuilt $BuildDir)"
+}
 
 $PortExe     = Join-Path $BuildDir "nhllegacy.exe"
 $BuilderExe  = Join-Path $BuildDir "tools\packager\nhl-legacy-builder.exe"
