@@ -6,7 +6,7 @@ REM pgo\nhllegacy.profdata (produced by: llvm-profdata merge -output=... *.profr
 REM Separate build dir; dev/opt/pgogen builds untouched.
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 set "PATH=C:\Program Files\LLVM\bin;%PATH%"
-set "VKSDK=E:/Tools/rexglue-sdk/src/out/install/win-amd64"
+set "VKSDK=E:/Tools/rexglue-sdk/src/out/install/win-amd64-ffx"
 set "BDIR=e:/Repositories/nhl-legacy-recomp/out/build/win-amd64-vk-pgo"
 set "PROFDATA=e:/Repositories/nhl-legacy-recomp/pgo/nhllegacy.profdata"
 if "%1"=="configure" (

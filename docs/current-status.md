@@ -26,6 +26,9 @@ historical context for how we got here.
 - **SDK source patches** — exp_adjust word-3 (jersey font), `readback_resolve=full` (equipment),
   signed BC5/DXN normal maps.
 - **In-game enhancements overlay** — ImGui settings/perf HUD/supersampling on the Vulkan path.
+- **Color-grade post-process** — live "Lighting / Color Grade" overlay section (exposure/contrast/
+  saturation/brightness/white-balance/filmic tone-map) as a compute pass after the swap gamma-apply;
+  `present_grade_*` cvars, identity-default no-op (commit `768c484`).
 - **Perf toolchain** — Release+LTO+PGO+native build is the #1 lever; supersampling ~free.
 
 ## Superseded / reference-only
@@ -37,12 +40,27 @@ backend, not these.
 
 ## Build & run
 
+**THE canonical build is `-vk-ffx` (FidelityFX on).** Decided 2026-06-17. There is ONE game
+source tree (`E:\Repositories\nhl-legacy-recomp`, `master`) and ONE SDK source tree
+(`E:\Tools\rexglue-sdk\src`); the `-vk` vs `-vk-ffx` split is only two CMake output dirs + two SDK
+install prefixes, NOT divergent source. FFX is opt-in at runtime (default `present_effect=bilinear`
+≡ non-FFX), so `-vk-ffx` is a strict superset of the old plain `-vk` build, which is **retired**.
+Every dev instance must build `-vk-ffx` so no compiled binary goes stale.
+
 ```
-_build_vk.bat build          # rebuild the nhllegacy Vulkan target (recomp only)
-_build_vk.bat configure      # one-time / after CMake changes
+_ffx_sdk_build_install.bat   # SDK -> out/install/win-amd64-ffx  (only when patching rexglue source)
+_game_ffx_build.bat          # game -> out/build/win-amd64-vk-ffx
 ```
-Run on the Vulkan path: `NHL_VK_BACKEND=1` (defaults to `fsi`). Diagnostic driver: `_vknet.ps1`.
-SDK rebuild (only when patching rexglue source): `E:\Tools\rexglue-sdk\src\_build_vk.bat`.
+Canonical exe: `out\build\win-amd64-vk-ffx\nhllegacy.exe`. Run on the Vulkan path with
+`NHL_VK_BACKEND=1` (defaults to `fsi`). Diagnostic driver: `_vknet.ps1`.
+
+- `_build_vk.bat` is now a **deprecation shim** that redirects to `_game_ffx_build.bat`.
+- Optimized/PGO release builds (`_build_vk_opt.bat`, `_build_vk_pgo.bat`, `_build_vk_pgogen.bat`)
+  now link the **FFX** SDK install. Their existing build dirs were configured against the old
+  non-FFX prefix — **delete `out/build/win-amd64-vk-{opt,pgo,pgogen}` before the next run** so they
+  reconfigure cleanly against `win-amd64-ffx`.
+- The stale non-FFX SDK install (`out/install/win-amd64`) and game dir (`out/build/win-amd64-vk`)
+  can be deleted once every instance is off them.
 
 ## Active / open
 

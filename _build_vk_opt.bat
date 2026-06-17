@@ -8,7 +8,7 @@ REM   (AVX2/BMI/MOVBE codegen for the recomp's byte-swap/FP hot paths). Tuned to
 REM   machine's CPU. Stage 2 (ThinLTO) is layered on once Stage 1 is proven.
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 set "PATH=C:\Program Files\LLVM\bin;%PATH%"
-set "VKSDK=E:/Tools/rexglue-sdk/src/out/install/win-amd64"
+set "VKSDK=E:/Tools/rexglue-sdk/src/out/install/win-amd64-ffx"
 set "BDIR=e:/Repositories/nhl-legacy-recomp/out/build/win-amd64-vk-opt"
 if "%1"=="configure" (
   REM Base config stays RelWithDebInfo so the prebuilt SDK's "rd"-suffixed imported

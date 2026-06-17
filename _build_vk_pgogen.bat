@@ -7,7 +7,7 @@ REM profile via __llvm_profile_write_file, gated by NHL_PGO_INSTRUMENT).
 REM Separate build dir; dev/opt builds untouched.
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 set "PATH=C:\Program Files\LLVM\bin;%PATH%"
-set "VKSDK=E:/Tools/rexglue-sdk/src/out/install/win-amd64"
+set "VKSDK=E:/Tools/rexglue-sdk/src/out/install/win-amd64-ffx"
 set "BDIR=e:/Repositories/nhl-legacy-recomp/out/build/win-amd64-vk-pgogen"
 if "%1"=="configure" (
   cmake -S e:/Repositories/nhl-legacy-recomp -B %BDIR% -G Ninja ^
