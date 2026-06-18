@@ -1,72 +1,71 @@
-# nhl-legacy-recomp
+# NHL Legacy Recomp
 
-Native PC port of NHL Legacy (Xbox 360) by static recompilation, built on the
-ReXGlue SDK (Xenia-derived runtime). Reverse-engineering notes and analysis
-live in `../nhl-re`.
+A native **PC port of NHL Legacy** (Xbox 360), produced by static recompilation —
+the original game's code is translated into a native Windows executable rather than
+emulated, so it runs as a real PC application with modern rendering on top.
 
-## Layout
+> ⚠️ **You must provide your own legally dumped copy of the game.** This project
+> ships **no game content** of any kind. It cannot be used without a copy of NHL
+> Legacy that you own and have dumped yourself. **Piracy is not condoned** — do not
+> ask for, share, or use illegally obtained game files. This project is not
+> affiliated with or endorsed by EA or Microsoft.
 
-- `nhllegacy_manifest.toml` / `nhllegacy_functions.toml` - ReXGlue codegen
-  config + hand-curated scanner-missed function addresses (specific to the
-  vanilla `default.xex`).
-- `generated/` - recompiled C++ emitted by `rexglue codegen` (181 files).
-- `src/` - the host app: cvar config, cache VFS mount, camera stubs,
-  diagnostics. `OnConfigurePaths` defaults `game_data_root` to an
-  exe-relative `game/` dir so end-user installs launch with no arguments.
-- `tools/packager/` - **nhl-legacy-builder**, the end-user CLI that turns a
-  disc dump (raw .iso or extracted folder) into a ready-to-run install:
-  validates `default.xex` by SHA-256 against the payload manifest, extracts
-  the XDVDFS image, lays down the prebuilt port binaries.
-- `tools/*.py|ps1` - RE/diagnostic scripts (GPU trace analysis, guest stack
-  annotation, UI driving).
-- `release/package.ps1` - dev-side release pipeline: build port + builder,
-  generate the payload manifest (hash pinned from `assets/default.xex`),
-  stage and zip the end-user package.
-- `assets/default.xex` - reference vanilla XEX (hash source for releases).
+## What you get
 
-## Dev build
+- **Native performance** — runs as a real Windows program (no emulator), at
+  real-time framerates well above the original console.
+- **Modern Vulkan renderer** with **AMD FidelityFX** (FSR upscaling / CAS
+  sharpening), optional **supersampling**, and a live **color-grade** pass
+  (exposure / contrast / saturation / white balance / tone mapping).
+- **In-game overlay** — a settings panel, performance HUD, and display options
+  (fullscreen / borderless, monitor select), toggled with a button on screen.
+- **Loose-file friendly** — the installer unpacks the game's archives into a
+  browsable file tree, so the community can inspect and replace assets.
 
-Requires LLVM/Clang, Ninja, CMake 3.25+, and the ReXGlue SDK
-(`-DCMAKE_PREFIX_PATH=<sdk>/win-amd64` on first configure).
+## Requirements
 
-```powershell
-cmake --preset win-amd64-relwithdebinfo -DCMAKE_PREFIX_PATH=E:/Tools/rexglue-sdk/0.8.0/win-amd64
-cmake --build --preset win-amd64-relwithdebinfo                       # port + builder
-cmake --build --preset win-amd64-relwithdebinfo --target nhllegacy_codegen  # re-run codegen (only after manifest/XEX changes)
-```
+- Windows 10 / 11, 64-bit
+- A **Vulkan-capable GPU**
+- The [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+- ~10 GB free disk space
+- **Your own dumped copy of NHL Legacy** — either a raw `.iso` of your disc, or an
+  already-extracted game folder containing `default.xex`
 
-Run the dev build against a game folder:
+## Getting started
 
-```powershell
-out\build\win-amd64-relwithdebinfo\nhllegacy.exe --game_data_root "H:\...\NHL Legacy - Vanilla"
-```
+1. Download the latest release zip from the
+   [**Releases**](https://github.com/puckhead73/nhl-legacy-recomp/releases) page and
+   extract it anywhere (keep the files together).
+2. Run the builder with your own dump — either double-click
+   `nhl-legacy-builder.exe` for prompts, or from a terminal:
 
-## Cutting a release
+   ```
+   nhl-legacy-builder install --iso "C:\dumps\NHL Legacy.iso" --out "C:\Games\NHL Legacy"
+   ```
 
-```powershell
-.\release\package.ps1 -Version 0.1.0 -TestInput "H:\...\NHL Legacy - Vanilla"
-```
+   (Use `--from "C:\path\to\extracted folder"` instead of `--iso` if you already
+   have an extracted game folder.)
+3. Launch `nhllegacy.exe` from the output folder. No arguments needed.
 
-Produces `out/release/nhl-legacy-recomp-<ver>.zip`: the builder CLI +
-`payload/` (prebuilt `nhllegacy.exe`, runtime DLLs, manifest) + docs/license
-notices. The `-TestInput` self-check unzips the artifact and verifies a real
-dump against the baked hash. Ships the relwithdebinfo (`rd`) runtime flavor -
-the only one play-tested so far.
-
-## End-user flow
+To check that a dump is supported without doing a full install:
 
 ```
-nhl-legacy-builder install --iso "C:\dumps\NHL Legacy.iso" --out "C:\Games\NHL Legacy"
-nhl-legacy-builder verify  --iso "C:\dumps\NHL Legacy.iso"   # validate only
+nhl-legacy-builder verify --iso "C:\dumps\NHL Legacy.iso"
 ```
 
-or double-click `nhl-legacy-builder.exe` for interactive prompts. The result
-is `<out>\nhllegacy.exe` + `<out>\game\` - launches with no arguments.
+The build is recompiled from one specific vanilla image of the game, so the builder
+verifies your `default.xex` by hash. A different region, a modified dump, or one with
+a title update applied will not pass validation.
 
-## Gotchas
+## Legal
 
-- The packager must use a **wide entry point** (`wmain`): rexruntime's
-  `GetExecutablePath` calls `_get_wpgmptr`, which fail-fasts (0xC0000409)
-  in narrow-CRT processes. See `tools/packager/src/main.cpp`.
-- Gated integration tests: configure with `-DNHLLEGACY_TEST_ISO=<path>` /
-  `-DNHLLEGACY_TEST_GAME_DIR=<path>` and run `ctest` in the build dir.
+You must own NHL Legacy and dump your own copy. No game assets are included or
+distributed with this project, and none will be provided. This is a fan
+preservation/portability effort, not affiliated with or endorsed by EA or Microsoft.
+See `THIRD-PARTY-NOTICES.txt` in the release for bundled component licenses.
+
+## For developers
+
+Building the port from source, the recompilation pipeline, the release process, and
+architecture notes live in **[DEV-README.md](DEV-README.md)** and
+**[docs/current-status.md](docs/current-status.md)**.
