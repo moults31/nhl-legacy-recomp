@@ -13,8 +13,8 @@ if "%1"=="configure" (
   cmake -S e:/Repositories/nhl-legacy-recomp -B %BDIR% -G Ninja ^
     -DCMAKE_BUILD_TYPE=RelWithDebInfo ^
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ ^
-    -DCMAKE_C_FLAGS_RELWITHDEBINFO="-O3 -DNDEBUG -march=native -fprofile-generate" ^
-    -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O3 -DNDEBUG -march=native -fprofile-generate -DNHL_PGO_INSTRUMENT" ^
+    -DCMAKE_C_FLAGS_RELWITHDEBINFO="-O3 -DNDEBUG -march=x86-64-v3 -fprofile-generate" ^
+    -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O3 -DNDEBUG -march=x86-64-v3 -fprofile-generate -DNHL_PGO_INSTRUMENT" ^
     -DCMAKE_EXE_LINKER_FLAGS="-fprofile-generate" ^
     -DCMAKE_PREFIX_PATH=%VKSDK% ^
     -DNHLLEGACY_VULKAN_BACKEND=ON ^
