@@ -8,18 +8,18 @@ with the VS generator and **imported as a prebuilt DLL**. The known-good
 
 ## Working build chain (reproducible)
 
-Scratch batch files in the repo root drive each step (Vulkan SDK 1.4.350 + VS2022
-BuildTools + LLVM required):
+Batch files under `scripts/` (run from the repo root) drive each step (Vulkan SDK
+1.4.350 + VS2022 BuildTools + LLVM required):
 
-1. `_ffx_dll_build.bat` — builds `amd_fidelityfx_vk.dll` + `.lib` with the **VS 2022
+1. `scripts\_ffx_dll_build.bat` — builds `amd_fidelityfx_vk.dll` + `.lib` with the **VS 2022
    generator** (`-G "Visual Studio 17 2022" -A x64 -DFFX_API_BACKEND=VK_X64`). Output
    stashed to `E:\Tools\rexglue-sdk\src\out\ffx-prebuilt\vk\`.
-2. `_ffx_sdk_configure.bat` — configures the SDK (clang/Ninja-MC) with
+2. `scripts\_ffx_sdk_configure.bat` — configures the SDK (clang/Ninja-MC) with
    `-DREXGLUE_ENABLE_FIDELITYFX=ON -DREXGLUE_FIDELITYFX_BACKEND=vk
    -DREXGLUE_FIDELITYFX_PREBUILT_DIR=...\out\ffx-prebuilt\vk`, install prefix
    `out\install\win-amd64-ffx`.
-3. `_ffx_sdk_build_install.bat` — builds + installs the SDK (RelWithDebInfo).
-4. `_game_ffx_build.bat` — configures+builds the game in `out\build\win-amd64-vk-ffx`
+3. `scripts\_ffx_sdk_build_install.bat` — builds + installs the SDK (RelWithDebInfo).
+4. `scripts\_game_ffx_build.bat` — configures+builds the game in `out\build\win-amd64-vk-ffx`
    with `CMAKE_PREFIX_PATH` → the FFX SDK prefix. Then copy
    `amd_fidelityfx_vk.dll` next to `nhllegacy.exe` (DELAYLOAD'd at runtime).
 

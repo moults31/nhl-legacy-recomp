@@ -47,15 +47,16 @@ install prefixes, NOT divergent source. FFX is opt-in at runtime (default `prese
 ≡ non-FFX), so `-vk-ffx` is a strict superset of the old plain `-vk` build, which is **retired**.
 Every dev instance must build `-vk-ffx` so no compiled binary goes stale.
 
+All dev/build scripts live under `scripts/` (run them from the repo root):
 ```
-_ffx_sdk_build_install.bat   # SDK -> out/install/win-amd64-ffx  (only when patching rexglue source)
-_game_ffx_build.bat          # game -> out/build/win-amd64-vk-ffx
+scripts\_ffx_sdk_build_install.bat   # SDK -> out/install/win-amd64-ffx  (only when patching rexglue source)
+scripts\_game_ffx_build.bat          # game -> out/build/win-amd64-vk-ffx
 ```
 Canonical exe: `out\build\win-amd64-vk-ffx\nhllegacy.exe`. Run on the Vulkan path with
-`NHL_VK_BACKEND=1` (defaults to `fsi`). Diagnostic driver: `_vknet.ps1`.
+`NHL_VK_BACKEND=1` (defaults to `fsi`). Diagnostic driver: `scripts\_vknet.ps1`.
 
-- `_build_vk.bat` is now a **deprecation shim** that redirects to `_game_ffx_build.bat`.
-- Optimized/PGO release builds (`_build_vk_opt.bat`, `_build_vk_pgo.bat`, `_build_vk_pgogen.bat`)
+- `scripts\_build_vk.bat` is now a **deprecation shim** that redirects to `scripts\_game_ffx_build.bat`.
+- Optimized/PGO release builds (`scripts\_build_vk_opt.bat`, `_build_vk_pgo.bat`, `_build_vk_pgogen.bat`)
   link the **FFX** SDK install (`E:/Tools/rexglue-sdk/src/out/install/win-amd64-ffx`).
 - **Consolidation complete (2026-06-17):** the stale non-FFX build dirs
   (`out/build/win-amd64-vk{,-opt,-pgo,-pgogen}`) and the non-FFX SDK install

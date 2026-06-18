@@ -1340,7 +1340,7 @@ void LoadC5Frames(PlumeCtx& c, const std::vector<std::vector<uint8_t>>* liveDraw
         if (std::fscanf(cf, "%u", &count) != 1) count = 0;
         std::fclose(cf);
     }
-    if (!count) { if (!live) REXLOG_INFO("[highcut-C5] no highcut_frame.count — run _c5dump.ps1 first"); return; }
+    if (!count) { if (!live) REXLOG_INFO("[highcut-C5] no highcut_frame.count — run scripts/_c5dump.ps1 first"); return; }
     // C-5d.3: load the resolve graph BEFORE building draws, so BuildRenderableDraw can flag the PS
     // texture slots that sample a resolve dest (host-copy bindings) as it parses each packet.
     if (live) ParseResolveGraphBytes(c, *liveResolves);

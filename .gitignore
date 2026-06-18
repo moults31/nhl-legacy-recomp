@@ -43,10 +43,11 @@
 # the vk-perf-profile-findings memory). Large binary profiles, not for git.
 /pgo/
 
-# === Local dev/diagnostic driver scripts (scratch; the canonical build .bat
-# files — _game_ffx_build.bat, _ffx_sdk_*.bat, _build_*.bat — ARE tracked) ===
-/_*.ps1
-/run_*.ps1
+# === Local dev/diagnostic driver scripts, now under scripts/ (scratch; the
+# canonical build .bat files — scripts/_game_ffx_build.bat, _ffx_sdk_*.bat,
+# _build_*.bat — ARE tracked) ===
+/scripts/_*.ps1
+/scripts/run_*.ps1
 /_*.png
 /nullcall_ctx.txt
 

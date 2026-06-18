@@ -6,9 +6,9 @@
 #
 # THE canonical release ships the Vulkan-fsi `win-amd64-vk-ffx` build (see
 # docs/current-status.md). That build has NO cmake preset - it's configured
-# directly by _game_ffx_build.bat - so this script packages the prebuilt,
+# directly by scripts\_game_ffx_build.bat - so this script packages the prebuilt,
 # play-tested dir as-is (vk presets auto-imply -SkipBuild). Build/refresh it
-# first with `_game_ffx_build.bat` (and `_ffx_sdk_build_install.bat` if the SDK
+# first with `scripts\_game_ffx_build.bat` (and `scripts\_ffx_sdk_build_install.bat` if the SDK
 # source changed), then run this. The nhl-legacy-builder packager target must
 # also be present in that tree (build with `cmake --build out\build\win-amd64-vk-ffx
 # --target nhl-legacy-builder` under a vcvars64 + Vulkan SDK shell).
@@ -49,10 +49,10 @@ elseif ($Preset -like "*relwithdebinfo" -or $Preset -like "*vk*") { $Flavor = "r
 else { throw "Unrecognized preset '$Preset'" }
 
 # The Vulkan builds (win-amd64-vk*) have no CMakePresets entry - they are
-# configured by _game_ffx_build.bat. There is nothing for `cmake --preset` to
+# configured by scripts\_game_ffx_build.bat. There is nothing for `cmake --preset` to
 # build, so a vk preset always packages the prebuilt dir as-is.
 if ($Preset -like "*vk*" -and -not $SkipBuild) {
-    Write-Host "Note: '$Preset' is configured by _game_ffx_build.bat (no cmake preset); packaging the prebuilt dir. Rebuild it first if stale." -ForegroundColor Yellow
+    Write-Host "Note: '$Preset' is configured by scripts\_game_ffx_build.bat (no cmake preset); packaging the prebuilt dir. Rebuild it first if stale." -ForegroundColor Yellow
     $SkipBuild = $true
 }
 
@@ -79,7 +79,7 @@ if ($RunCodegen) {
 
 # --- 2. Configure + build the port and the packager ---
 # With -SkipBuild we package an already-built dir as-is (e.g. the Vulkan PGO build
-# produced by _build_vk_pgo.bat, which presets/cmake --preset don't cover).
+# produced by scripts\_build_vk_pgo.bat, which presets/cmake --preset don't cover).
 if (-not $SkipBuild) {
     Step "Configure ($Preset)"
     $SdkDirFwd = $SdkDir -replace '\\', '/'
@@ -100,7 +100,7 @@ $BuilderExe  = Join-Path $BuildDir "tools\packager\nhl-legacy-builder.exe"
 $RuntimeDll  = "rexruntime$Flavor.dll"
 $TracyDll    = "TracyClient$Flavor.dll"
 if (-not (Test-Path $PortExe)) {
-    throw "Port exe missing: $PortExe. Build it with _game_ffx_build.bat first."
+    throw "Port exe missing: $PortExe. Build it with scripts\_game_ffx_build.bat first."
 }
 if (-not (Test-Path $BuilderExe)) {
     throw "Packager missing: $BuilderExe. Build it under a vcvars64 + Vulkan SDK shell:`n  cmake --build `"$BuildDir`" --target nhl-legacy-builder"
