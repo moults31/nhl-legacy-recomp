@@ -3,9 +3,13 @@
 
 #include "anim_decode.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cstdarg>
@@ -458,7 +462,11 @@ bool WaitForAnimData(const unsigned char* vbase, unsigned timeout_ms) {
       std::fprintf(stderr, "[anim-scan] anim.cba resident (clip name in heap @ %08X)\n", va);
       return true;
     }
+#ifdef _WIN32
     ::Sleep(step);
+#else
+    ::usleep(static_cast<useconds_t>(step) * 1000u);
+#endif
   }
   return false;
 }

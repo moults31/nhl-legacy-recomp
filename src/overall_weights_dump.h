@@ -398,6 +398,17 @@ after_scan:
        total_hits, double(scanned_bytes) / (1024.0 * 1024.0));
   if (out != stderr) std::fclose(out);
 }
+#else  // !_WIN32
+
+// Linux: guest RAM is one host mapping; treat in-range VAs as readable.
+inline bool rt_readable(const uint8_t* /*vbase*/, uint32_t gva, size_t len) {
+  return len == 0 || gva <= 0xffffffffu - static_cast<uint32_t>(len);
+}
+
+inline void DumpOverallWeightsRuntime(const uint8_t*, const char*) {
+  std::fprintf(stderr, "[ovr-rt] not supported on Linux\n");
+}
+
 #endif  // _WIN32
 
 }  // namespace nhllegacy

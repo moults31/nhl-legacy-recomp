@@ -20,6 +20,8 @@ class Memory;
 
 namespace nhllegacy {
 
+#if defined(_WIN32)
+
 // Runs the harness against guest memory `mem` (valid after Runtime::Setup),
 // writing a human-readable report to `out_path`. Returns true iff every check
 // passed. Self-contained: allocates its own guest stack + scratch buffers.
@@ -39,5 +41,14 @@ void RunAnimScan(const unsigned char* vbase, const char* out_path);
 // false on timeout. Lets the recon auto-fire at the right moment instead of racing
 // a fixed delay against the user navigating into a game.
 bool WaitForAnimData(const unsigned char* vbase, unsigned timeout_ms);
+
+#else  // !_WIN32
+
+// Windows VirtualQuery-based harness; stubs on Linux.
+inline bool RunAnimDecode(rex::memory::Memory*, const char*) { return false; }
+inline void RunAnimScan(const unsigned char*, const char*) {}
+inline bool WaitForAnimData(const unsigned char*, unsigned) { return false; }
+
+#endif
 
 }  // namespace nhllegacy

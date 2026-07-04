@@ -61,6 +61,12 @@ inline void CaptureStickCaller(const char* stick_name, const char* out_path) {
   if (f != stderr) std::fclose(f);
 }
 
+#else  // !_WIN32
+
+inline void CaptureStickCaller(const char* /*stick_name*/, const char* /*out_path*/) {
+  // Windows-only stack capture (RtlCaptureStackBackTrace); no-op on Linux.
+}
+
 #endif  // _WIN32
 
 }  // namespace nhllegacy

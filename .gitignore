@@ -1,11 +1,16 @@
 # === Build output (multi-GB) ===
 /out/
+# Legacy root caches from earlier Linux layouts (now under out/linux/)
+.cache/
+.deps/
+.tools/
 
 # === Regenerable recompiled sources (~374M each) ===
 # Regenerate with: cmake --build <build> --target nhllegacy_codegen
 # (needs the rexglue SDK + the game XEX). Not tracked to keep the repo lean.
 /generated/
 /generated.bak_080/
+nhllegacy_manifest.codegen.toml
 
 # === Large GPU trace captures (~439M; regenerable) ===
 /gpu_trace/

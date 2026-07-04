@@ -12,9 +12,11 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 
+#if defined(_WIN32)
 // Win32 keyboard poll for the F9 hotkey capture (declared directly to keep
 // <windows.h> out of this TU, mirroring the D3D12 path).
 extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int v_key);
+#endif
 
 namespace nhl::graphics {
 
@@ -202,8 +204,13 @@ void NhlVkCommandProcessor::PollHotkeyCapture() {
   }
   if (!hotkey_enabled_) return;
 
+#if defined(_WIN32)
   constexpr int kVkF9 = 0x78;
   const bool down = (GetAsyncKeyState(kVkF9) & 0x8000) != 0;
+#else
+  // Linux: no Win32 hotkey poll; F9 capture is Windows-only for now.
+  const bool down = false;
+#endif
   const bool rising = down && !hotkey_prev_down_;
   hotkey_prev_down_ = down;
   if (!rising) return;

@@ -147,6 +147,12 @@ inline void ScanStickList(const uint8_t* vbase, const char* out_path) {
   if (out != stderr) std::fclose(out);
 }
 
+#else  // !_WIN32
+
+inline void ScanStickList(const uint8_t*, const char*) {
+  std::fprintf(stderr, "[stick-scan] not supported on Linux\n");
+}
+
 #endif  // _WIN32
 
 }  // namespace nhllegacy

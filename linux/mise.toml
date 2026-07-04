@@ -1,0 +1,7 @@
+# Pinned toolchain for the native Linux Docker image (linux/docker/Dockerfile).
+# Not used on the host — linux/build.sh compiles inside the image.
+
+[tools]
+cmake = "3.28.3"
+ninja = "1.12.1"
+clang = "20.1.7"
