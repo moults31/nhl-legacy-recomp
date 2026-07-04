@@ -308,6 +308,17 @@ class NhllegacyApp : public rex::ReXApp {
     // dev env overrides) at launch. Both SDK cvars are read once during
     // SetupPresentation, so they must be set before the window is created here.
     {
+      {
+        const auto settings_path = nhl::SettingsPath();
+        const auto kv = nhl::LoadSettings();
+        if (kv.empty()) {
+          REXLOG_INFO("[nhl-settings] no nhl_enhancements.ini at {}",
+                      settings_path.string());
+        } else {
+          REXLOG_INFO("[nhl-settings] loaded {} key(s) from {}", kv.size(),
+                      settings_path.string());
+        }
+      }
       bool start_fullscreen = nhl::LoadFullscreen(/*fallback=*/false);
       if (const char* e = std::getenv("NHL_VK_FULLSCREEN"); e && *e) {
         start_fullscreen = (*e != '0');
@@ -327,7 +338,9 @@ class NhllegacyApp : public rex::ReXApp {
 
       // V-Sync: restart-required SDK cvar. Apply the persisted overlay choice;
       // an absent key leaves the SDK default (true) untouched.
-      REXCVAR_SET(vsync, nhl::LoadVsync(REXCVAR_GET(vsync)));
+      const bool start_vsync = nhl::LoadVsync(REXCVAR_GET(vsync));
+      REXCVAR_SET(vsync, start_vsync);
+      REXLOG_INFO("[nhl-display] vsync={}", start_vsync);
     }
 #ifdef NHL_HAVE_VULKAN_BACKEND
     // Enhancement A (docs/vulkan-enhancements-kickoff-prompt.md §3.A): internal-
@@ -356,9 +369,9 @@ class NhllegacyApp : public rex::ReXApp {
       // FidelityFX present-time scaler (FSR/CAS). Only present when the SDK was
       // built with REXGLUE_ENABLE_FIDELITYFX=ON; the cvars are restart-required,
       // so apply the persisted overlay choices here before SetupPresentation.
-#if defined(REX_HAS_FIDELITYFX_SDK)
       {
         const std::string effect = nhl::LoadFfxEffect(/*fallback=*/"bilinear");
+#if defined(REX_HAS_FIDELITYFX_SDK)
         if (effect != "bilinear") {
           REXCVAR_SET(present_effect, effect);
           REXCVAR_SET(present_cas_additional_sharpness,
@@ -367,11 +380,18 @@ class NhllegacyApp : public rex::ReXApp {
                       nhl::LoadFfxFsrSharpness(REXCVAR_GET(present_fsr_sharpness_reduction)));
           REXLOG_INFO("[nhl-vk-ffx] present effect '{}'", effect);
         }
-      }
+#else
+        if (effect != "bilinear") {
+          REXLOG_INFO("[nhl-vk-ffx] ini requests '{}' but this build has no FidelityFX "
+                      "(ignored; use supersampling for quality)",
+                      effect);
+        }
 #endif
+      }
 
+      // Color-grade / shadow cvars live in the NHL-patched SDK (Windows release
+      // and linux/ build both apply docs/rexglue-vulkan-nhl-legacy.patch).
 #if defined(_WIN32)
-      // Color-grade / shadow cvars are Windows-SDK-only (not in Linux prebuilt).
       if (nhl::LoadGradeEnable(/*fallback=*/false)) {
         REXCVAR_SET(present_grade_enable, true);
         REXCVAR_SET(present_grade_exposure, nhl::LoadGradeExposure(0.0));
@@ -383,6 +403,7 @@ class NhllegacyApp : public rex::ReXApp {
         REXCVAR_SET(present_grade_tonemap, nhl::LoadGradeTonemap(0.0));
         REXLOG_INFO("[nhl-vk-grade] color grade enabled from persisted settings");
       }
+#endif
 
       {
         bool soften = nhl::LoadShadowFilterLinear(REXCVAR_GET(shadow_filter_linear));
@@ -405,7 +426,6 @@ class NhllegacyApp : public rex::ReXApp {
           REXLOG_INFO("[nhl-vk-shadow] shadow softness blur passes = {}", softness);
         }
       }
-#endif
     }
 #endif
 #if defined(_WIN32)
