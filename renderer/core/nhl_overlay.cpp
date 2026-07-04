@@ -27,17 +27,10 @@ REXCVAR_DECLARE(int32_t, draw_resolution_scale_x);
 REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 REXCVAR_DECLARE(bool, vsync);
 
-// Bilinear filtering for guest depth/shadow maps (SDK texture cache). Read
-// per-draw, so toggling it takes effect immediately — no restart.
+// Shadow / color-grade cvars: Windows SDK only (not in stock Linux prebuilt).
+#if defined(_WIN32)
 REXCVAR_DECLARE(bool, shadow_filter_linear);
-// Extra depth-domain blur passes on depth/shadow maps (0..4). Read per texture
-// upload, so it takes effect within a frame or two — no restart.
 REXCVAR_DECLARE(int32_t, shadow_softness);
-
-// NHL Legacy color-grade post-process cvars (defined in the SDK Vulkan command
-// processor; applied in place on the guest-output image right after the swap
-// gamma-apply). All hot-reloadable, so slider edits take effect on the next
-// present. Defaults are identity, so the pass is a no-op until enabled.
 REXCVAR_DECLARE(bool, present_grade_enable);
 REXCVAR_DECLARE(double, present_grade_exposure);
 REXCVAR_DECLARE(double, present_grade_contrast);
@@ -46,6 +39,7 @@ REXCVAR_DECLARE(double, present_grade_brightness);
 REXCVAR_DECLARE(double, present_grade_temperature);
 REXCVAR_DECLARE(double, present_grade_tint);
 REXCVAR_DECLARE(double, present_grade_tonemap);
+#endif
 
 // AMD FidelityFX present-time scaler cvars (UI/Presenter). These only exist when
 // the SDK is built with REXGLUE_ENABLE_FIDELITYFX=ON — the same switch that
@@ -246,6 +240,7 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
       ImGui::SameLine();
       ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "[restart]");
 
+#if defined(_WIN32)
       // Soften shadows: restore bilinear filtering on the guest's depth/shadow
       // maps. Read per-draw in the texture cache, so this is live (no restart).
       bool soften_shadows = REXCVAR_GET(shadow_filter_linear);
@@ -256,8 +251,6 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
       ImGui::TextDisabled("smooths hard, pixelated shadow edges (no effect if the "
                           "GPU can't linear-filter depth)");
 
-      // Extra depth-domain blur on shadow maps, beyond bilinear. Applied on upload,
-      // so it takes effect within a frame or two. 0 = off.
       int softness = REXCVAR_GET(shadow_softness);
       if (softness < 0) softness = 0;
       if (softness > 4) softness = 4;
@@ -268,6 +261,7 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
       }
       ImGui::TextDisabled("extra blur passes for a softer penumbra; higher can mildly "
                           "halo at contact points");
+#endif
     }
 
     // --- Upscaling & Sharpening (AMD FidelityFX) ---
@@ -312,11 +306,8 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
     }
 #endif
 
-    // --- Lighting / Color Grade ---
-    // Drives the SDK present_grade_* cvars (an in-place compute pass after the
-    // swap gamma-apply). Hot-reloadable: edits take effect on the next present.
-    // Each control persists so the look survives a relaunch (OnPreSetup re-applies
-    // it). The whole pass is identity until "Enable color grade" is ticked.
+#if defined(_WIN32)
+    // --- Lighting / Color Grade (Windows SDK cvars only) ---
     if (ImGui::CollapsingHeader("Lighting / Color Grade", ImGuiTreeNodeFlags_DefaultOpen)) {
       bool grade_on = REXCVAR_GET(present_grade_enable);
       if (ImGui::Checkbox("Enable color grade", &grade_on)) {
@@ -381,6 +372,7 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
 
       ImGui::EndDisabled();
     }
+#endif
 
     // --- Engine Tunables (live World-B constants) ---
     DrawTunables();

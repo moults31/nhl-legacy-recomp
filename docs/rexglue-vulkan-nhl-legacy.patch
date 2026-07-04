@@ -337,8 +337,8 @@ index 4075dfb..6bffa67 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -13,12 +13,15 @@
+ #include <algorithm>
  #include <array>
- #include <cmath>
  #include <cstdint>
 +#include <cstdio>
 +#include <cstdlib>

@@ -22,6 +22,16 @@ inline std::filesystem::path SettingsPath() {
   return rex::filesystem::GetExecutableFolder() / "nhl_enhancements.ini";
 }
 
+// Trim CR so Windows-saved (CRLF) inis parse the same as LF-only files.
+inline void TrimIniToken(std::string& s) {
+  while (!s.empty() && (s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) {
+    s.pop_back();
+  }
+  size_t i = 0;
+  while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+  if (i) s.erase(0, i);
+}
+
 // Read the whole ini into an ordered key->value map (last value wins on dupes).
 inline std::map<std::string, std::string> LoadSettings() {
   std::map<std::string, std::string> kv;
@@ -29,9 +39,15 @@ inline std::map<std::string, std::string> LoadSettings() {
   if (!f) return kv;
   std::string line;
   while (std::getline(f, line)) {
+    TrimIniToken(line);
+    if (line.empty() || line[0] == '#' || line[0] == ';') continue;
     const auto eq = line.find('=');
     if (eq == std::string::npos) continue;
-    kv[line.substr(0, eq)] = line.substr(eq + 1);
+    std::string key = line.substr(0, eq);
+    std::string val = line.substr(eq + 1);
+    TrimIniToken(key);
+    TrimIniToken(val);
+    if (!key.empty()) kv[key] = val;
   }
   return kv;
 }

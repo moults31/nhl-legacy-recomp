@@ -52,7 +52,12 @@ const bool g_enabled = std::getenv("NHL_HIGHCUT") != nullptr;
 
 // H-2: drive the in-process plume swapchain once per guest Present. Implemented in
 // gpu/hooks/plume_present.cpp; self-gating on NHL_HIGHCUT_PRESENT (no-op otherwise).
+// plume_present.cpp (defines HighcutPlumeTick) is excluded under NHLLEGACY_VULKAN_ONLY.
+#if defined(NHLLEGACY_VULKAN_ONLY)
+extern "C" void HighcutPlumeTick() {}
+#else
 extern "C" void HighcutPlumeTick();
+#endif
 
 namespace {
 

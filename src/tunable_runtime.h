@@ -194,6 +194,33 @@ class TunableRuntimeStore final : public nhl::ui::ITunableStore {
     std::vector<bool> got(entries_.size(), false);
     std::vector<bool> scalar_hit(entries_.size(), false);
 
+    auto scan_region = [&](const uint8_t* rbase, size_t rsize) {
+      for (size_t o = 0; o + 4 <= rsize; o += 4) {
+        uint32_t v = be_u32(rbase + o);
+        auto it = by_va.find(v);
+        if (it == by_va.end()) continue;
+        const size_t idx = it->second;
+        if (got[idx] && scalar_hit[idx]) continue;
+        if (o + kValueOff + 4 > rsize) continue;
+        const uint32_t rec_va = uint32_t((rbase + o) - vbase_);
+        const uint32_t value_va = rec_va + kValueOff;
+        const uint32_t bits = be_u32(rbase + o + kValueOff);
+        const bool looks_ptr = rt_readable(vbase_, bits, 4) && bits >= IMG_BASE;
+        float fb;
+        std::memcpy(&fb, &bits, 4);
+        const bool scalar = !looks_ptr && std::isfinite(fb);
+        if (!got[idx] || (scalar && !scalar_hit[idx])) {
+          Entry& e = entries_[idx];
+          e.value_va = value_va;
+          e.captured_bits = bits;
+          e.scalar = scalar;
+          e.type = tr_infer_type(e.name, true, bits);
+          got[idx] = true;
+          scalar_hit[idx] = scalar;
+        }
+      }
+    };
+#if defined(_WIN32)
     const uint8_t* p = vbase_;
     const uint8_t* guest_end = vbase_ + (size_t)0x100000000ull;
     while (p < guest_end) {
@@ -203,35 +230,16 @@ class TunableRuntimeStore final : public nhl::ui::ITunableStore {
       size_t rsize = mbi.RegionSize;
       const bool scannable = mbi.State == MEM_COMMIT &&
                              !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
-      if (scannable && rbase >= vbase_) {
-        for (size_t o = 0; o + 4 <= rsize; o += 4) {
-          uint32_t v = be_u32(rbase + o);
-          auto it = by_va.find(v);
-          if (it == by_va.end()) continue;
-          const size_t idx = it->second;
-          if (got[idx] && scalar_hit[idx]) continue;
-          if (o + kValueOff + 4 > rsize) continue;
-          const uint32_t rec_va = uint32_t((rbase + o) - vbase_);
-          const uint32_t value_va = rec_va + kValueOff;
-          const uint32_t bits = be_u32(rbase + o + kValueOff);
-          const bool looks_ptr = rt_readable(vbase_, bits, 4) && bits >= IMG_BASE;
-          float fb;
-          std::memcpy(&fb, &bits, 4);
-          const bool scalar = !looks_ptr && std::isfinite(fb);
-          if (!got[idx] || (scalar && !scalar_hit[idx])) {
-            Entry& e = entries_[idx];
-            e.value_va = value_va;
-            e.captured_bits = bits;
-            e.scalar = scalar;
-            e.type = tr_infer_type(e.name, true, bits);
-            got[idx] = true;
-            scalar_hit[idx] = scalar;
-          }
-        }
-      }
+      if (scannable && rbase >= vbase_) scan_region(rbase, rsize);
       p = rbase + rsize;
       if (p <= rbase) break;
     }
+#else
+    // Linux: no VirtualQuery — scan the mapped guest image window only.
+    constexpr uint32_t kImageBase = 0x82000000u;
+    constexpr uint32_t kImageSize = 0x1EA0000u;
+    scan_region(vbase_ + kImageBase, kImageSize);
+#endif
 
     // Entries with no live value (located name but +8 unreadable / never hit):
     // infer type by name only and leave value_va = 0 (read/write are no-ops).

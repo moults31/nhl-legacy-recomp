@@ -643,6 +643,13 @@ inline void DumpTunableValuesRuntime(const uint8_t* vbase, const char* txt_path,
     }
   }
 }
+#else  // !_WIN32
+
+inline void DumpTunableValuesRuntime(const uint8_t*, const char*, const char*,
+                                     const char*) {
+  std::fprintf(stderr, "[tunables-rt] not supported on Linux\n");
+}
+
 #endif  // _WIN32
 
 }  // namespace nhllegacy

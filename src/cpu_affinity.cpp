@@ -1,26 +1,17 @@
 // cpu_affinity.cpp - Intel hybrid (P/E-core) thread placement.
-//
-// On Intel 12th-gen+ "hybrid" CPUs the OS scheduler can park the recompiled
-// game's heavy threads (NHL Sim / Render / JobManager workers, plus the SDK's
-// own GPU-Command / VSync threads) on the low-clock Efficiency (E) cores. For a
-// CPU/draw-submission-bound recomp that is a large perf cliff. This pins the
-// process's DEFAULT CPU set to the Performance (P) cores so every thread — guest
-// threads created through the SDK's KeSetAffinityThread mapping AND the SDK's own
-// host threads — inherits the P-core preference without per-thread plumbing.
-//
-// Env-gated by NHL_PIN_PCORES (default ON). Set NHL_PIN_PCORES=0 (or "off"/"false")
-// to disable, e.g. to A/B the effect. On non-hybrid CPUs (all AMD, pre-Alder-Lake
-// Intel) every core reports the same EfficiencyClass, so this is a no-op.
-//
-// Windows headers are confined to this TU (the widely-included nhllegacy_app.h
-// deliberately avoids <windows.h>); the app calls the plain extern below.
-
-#include <windows.h>
+// Windows implementation pins P-cores via SetProcessDefaultCpuSets.
+// Linux: no-op stub (scheduling left to the OS).
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#ifdef _WIN32
+#include <windows.h>
 #include <vector>
+#else
+#include <strings.h>
+#endif
 
 void rex_pin_pcores_if_hybrid();
 
@@ -28,12 +19,21 @@ namespace {
 
 bool env_disabled() {
   const char* v = std::getenv("NHL_PIN_PCORES");
-  if (!v || !*v) return false;  // unset/empty => enabled (default ON)
+  if (!v || !*v) return false;
+#ifdef _WIN32
   return std::strcmp(v, "0") == 0 || _stricmp(v, "off") == 0 ||
          _stricmp(v, "false") == 0 || _stricmp(v, "no") == 0;
+#else
+  auto ieq = [&](const char* s) {
+    return ::strcasecmp(v, s) == 0;
+  };
+  return std::strcmp(v, "0") == 0 || ieq("off") || ieq("false") || ieq("no");
+#endif
 }
 
 }  // namespace
+
+#ifdef _WIN32
 
 void rex_pin_pcores_if_hybrid() {
   if (env_disabled()) {
@@ -42,11 +42,9 @@ void rex_pin_pcores_if_hybrid() {
   }
 
   const HANDLE proc = GetCurrentProcess();
-
-  // Size the CPU-set buffer (first call with a null buffer returns the length).
   ULONG bytes = 0;
   GetSystemCpuSetInformation(nullptr, 0, &bytes, proc, 0);
-  if (bytes == 0) return;  // API unavailable / no info — leave scheduling to the OS.
+  if (bytes == 0) return;
 
   std::vector<unsigned char> buf(bytes);
   if (!GetSystemCpuSetInformation(
@@ -55,8 +53,6 @@ void rex_pin_pcores_if_hybrid() {
     return;
   }
 
-  // Walk the variable-length records, tracking the max EfficiencyClass (P-cores
-  // report the highest value) and collecting the CPU-set Ids in that class.
   BYTE max_eff = 0;
   bool multiple_classes = false;
   BYTE first_eff = 0;
@@ -73,7 +69,6 @@ void rex_pin_pcores_if_hybrid() {
     }
   };
 
-  // Pass 1: find the highest efficiency class and whether the system is hybrid.
   walk([&](const auto& cs) {
     if (!first_seen) { first_eff = cs.EfficiencyClass; first_seen = true; }
     else if (cs.EfficiencyClass != first_eff) { multiple_classes = true; }
@@ -82,12 +77,10 @@ void rex_pin_pcores_if_hybrid() {
 
   if (!first_seen) return;
   if (!multiple_classes) {
-    // Single efficiency class (AMD / non-hybrid Intel) — nothing to gain.
     std::fprintf(stderr, "[nhl-affinity] non-hybrid CPU; no P-core pinning\n");
     return;
   }
 
-  // Pass 2: collect the P-core (max EfficiencyClass) CPU-set Ids.
   walk([&](const auto& cs) {
     if (cs.EfficiencyClass == max_eff) pcore_ids.push_back(cs.Id);
   });
@@ -106,3 +99,15 @@ void rex_pin_pcores_if_hybrid() {
                  GetLastError());
   }
 }
+
+#else
+
+void rex_pin_pcores_if_hybrid() {
+  if (env_disabled()) {
+    std::fprintf(stderr, "[nhl-affinity] disabled via NHL_PIN_PCORES\n");
+    return;
+  }
+  std::fprintf(stderr, "[nhl-affinity] P-core pinning is Windows-only; no-op on Linux\n");
+}
+
+#endif

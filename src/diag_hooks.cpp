@@ -25,6 +25,7 @@
 #include <cstring>
 #include <thread>
 
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -354,3 +355,17 @@ static const int g_palette_dump_timer = [] {
   }).detach();
   return 0;
 }();
+
+#else  // !_WIN32
+
+#include <unistd.h>
+
+static void AbortContextTap(int) { _exit(3); }
+
+static const int g_abort_tap_installed = [] {
+  std::signal(SIGABRT, AbortContextTap);
+  return 0;
+}();
+
+#endif  // _WIN32
+

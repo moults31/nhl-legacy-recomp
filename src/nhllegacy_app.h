@@ -29,7 +29,9 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/presenter.h>
 
+#if defined(_WIN32)
 #include "renderer/core/nhl_graphics_system.h"
+#endif
 // SPIKE (docs/vulkan-rov-backend-spike-prompt.md): the SDK's Vulkan ROV backend
 // is a COMPILE-TIME option (REXGLUE_USE_VULKAN, OFF in the stock win-amd64 zips).
 // The header always installs; the implementation only links against an SDK built
@@ -103,7 +105,9 @@ REXCVAR_DECLARE(double, present_cas_additional_sharpness);
 REXCVAR_DECLARE(double, present_fsr_sharpness_reduction);
 #endif
 
-// NHL Legacy color-grade post-process cvars (SDK Vulkan command processor).
+// NHL-specific grade/shadow cvars: present in Windows SDK builds; the stock
+// Linux prebuilt SDK does not export their storage symbols.
+#if defined(_WIN32)
 REXCVAR_DECLARE(bool, present_grade_enable);
 REXCVAR_DECLARE(double, present_grade_exposure);
 REXCVAR_DECLARE(double, present_grade_contrast);
@@ -112,16 +116,16 @@ REXCVAR_DECLARE(double, present_grade_brightness);
 REXCVAR_DECLARE(double, present_grade_temperature);
 REXCVAR_DECLARE(double, present_grade_tint);
 REXCVAR_DECLARE(double, present_grade_tonemap);
-
-// NHL: bilinear filtering for guest depth/shadow maps (SDK texture cache).
 REXCVAR_DECLARE(bool, shadow_filter_linear);
-// NHL: extra depth-domain blur passes for guest depth/shadow maps (0..4).
 REXCVAR_DECLARE(int32_t, shadow_softness);
+#endif
 
+#if defined(_WIN32)
 // Win32 process-exit primitives (declared directly to avoid pulling <windows.h>
 // into this widely-included header). Used only by the replay-mode fast-exit.
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentProcess();
 extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void* handle, unsigned int code);
+#endif
 
 #ifdef NHL_PGO_INSTRUMENT
 // PGO instrumentation profile writer (compiler-rt profile runtime, auto-linked by
@@ -130,6 +134,37 @@ extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void* handle, un
 // hand before terminating. Only declared/called in the instrumented build.
 extern "C" int __llvm_profile_write_file(void);
 #endif
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
+namespace nhllegacy_detail {
+inline void set_env(const char* key, const char* value) {
+#if defined(_WIN32)
+  _putenv_s(key, value);
+#else
+  ::setenv(key, value, 1);
+#endif
+}
+inline void sleep_ms(unsigned ms) {
+#if defined(_WIN32)
+  ::Sleep(ms);
+#else
+  ::usleep(static_cast<useconds_t>(ms) * 1000u);
+#endif
+}
+inline void fast_exit(unsigned code) {
+#ifdef NHL_PGO_INSTRUMENT
+  __llvm_profile_write_file();
+#endif
+#if defined(_WIN32)
+  ::TerminateProcess(::GetCurrentProcess(), code);
+#else
+  std::_Exit(static_cast<int>(code));
+#endif
+}
+}  // namespace nhllegacy_detail
 
 // Intel hybrid (P/E-core) thread placement — defined in src/cpu_affinity.cpp.
 // Pins the process default CPU set to the Performance cores so the recomp's heavy
@@ -162,7 +197,7 @@ class NhllegacyApp : public rex::ReXApp {
     // env vars. NHL_VK_BACKEND_OFF=1 forces the legacy D3D12 path as a fallback for
     // GPUs lacking fragment-shader-interlock (the fsi path the in-game 3D needs).
     if (!std::getenv("NHL_VK_BACKEND") && !std::getenv("NHL_VK_BACKEND_OFF")) {
-      _putenv_s("NHL_VK_BACKEND", "1");
+      nhllegacy_detail::set_env("NHL_VK_BACKEND", "1");
     }
 #endif
 #ifdef NHL_HAVE_VULKAN_BACKEND
@@ -207,7 +242,7 @@ class NhllegacyApp : public rex::ReXApp {
         // ~1 MB). Default the threshold to 3 MB (keeps every composite, skips only
         // the framebuffers). Override via the env (set to 0 to disable the gate).
         if (!std::getenv("NHL_VK_READBACK_MAX_LEN")) {
-          _putenv_s("NHL_VK_READBACK_MAX_LEN", "3000000");
+          nhllegacy_detail::set_env("NHL_VK_READBACK_MAX_LEN", "3000000");
         }
         REXLOG_INFO("[nhl-vk] resolve readback enabled (readback_resolve=full, "
                     "size gate {} B)",
@@ -222,7 +257,17 @@ class NhllegacyApp : public rex::ReXApp {
                   vk_rt ? vk_rt : "fsi");
     } else
 #endif
+#if defined(_WIN32)
     config.graphics = std::make_unique<nhl::graphics::NhlD3D12GraphicsSystem>();
+#elif defined(NHL_HAVE_VULKAN_BACKEND)
+    {
+      // Linux has no D3D12 path; force Vulkan if the env gate was cleared.
+      nhllegacy_detail::set_env("NHL_VK_BACKEND", "1");
+      config.graphics = std::make_unique<nhl::graphics::NhlVkGraphicsSystem>();
+    }
+#else
+#error "Linux build requires NHL_HAVE_VULKAN_BACKEND"
+#endif
     REXCVAR_SET(protect_zero, false);  // see comment at REXCVAR_DECLARE above
     // NHL Legacy reads heap fields it never wrote (sub_82705510 record walk);
     // it relies on allocations being zero-filled like Xenia/Windows provide.
@@ -238,8 +283,11 @@ class NhllegacyApp : public rex::ReXApp {
     // screens and renders anyway with this enabled; testing whether the
     // green flash/overlay artifacts come from skipped fetches.
     REXCVAR_SET(gpu_allow_invalid_fetch_constants, true);
+#if defined(_WIN32)
     // Accurate EDRAM path (in-game scene renders black under the rtv path).
+    // Not exported by the stock Linux prebuilt SDK.
     REXCVAR_SET(render_target_path_d3d12, std::string("rov"));
+#endif
     // Black-screen diagnosis: flip to true to dump the guest PM4 stream to
     // gpu_trace/<title>_stream.xtr (~5MB / 25s boot). Parse with
     // tools/parse_gpu_trace.py / trace_resolve_analysis.py. Xenia accepts the
@@ -260,6 +308,17 @@ class NhllegacyApp : public rex::ReXApp {
     // dev env overrides) at launch. Both SDK cvars are read once during
     // SetupPresentation, so they must be set before the window is created here.
     {
+      {
+        const auto settings_path = nhl::SettingsPath();
+        const auto kv = nhl::LoadSettings();
+        if (kv.empty()) {
+          REXLOG_INFO("[nhl-settings] no nhl_enhancements.ini at {}",
+                      settings_path.string());
+        } else {
+          REXLOG_INFO("[nhl-settings] loaded {} key(s) from {}", kv.size(),
+                      settings_path.string());
+        }
+      }
       bool start_fullscreen = nhl::LoadFullscreen(/*fallback=*/false);
       if (const char* e = std::getenv("NHL_VK_FULLSCREEN"); e && *e) {
         start_fullscreen = (*e != '0');
@@ -279,7 +338,9 @@ class NhllegacyApp : public rex::ReXApp {
 
       // V-Sync: restart-required SDK cvar. Apply the persisted overlay choice;
       // an absent key leaves the SDK default (true) untouched.
-      REXCVAR_SET(vsync, nhl::LoadVsync(REXCVAR_GET(vsync)));
+      const bool start_vsync = nhl::LoadVsync(REXCVAR_GET(vsync));
+      REXCVAR_SET(vsync, start_vsync);
+      REXLOG_INFO("[nhl-display] vsync={}", start_vsync);
     }
 #ifdef NHL_HAVE_VULKAN_BACKEND
     // Enhancement A (docs/vulkan-enhancements-kickoff-prompt.md §3.A): internal-
@@ -308,9 +369,9 @@ class NhllegacyApp : public rex::ReXApp {
       // FidelityFX present-time scaler (FSR/CAS). Only present when the SDK was
       // built with REXGLUE_ENABLE_FIDELITYFX=ON; the cvars are restart-required,
       // so apply the persisted overlay choices here before SetupPresentation.
-#if defined(REX_HAS_FIDELITYFX_SDK)
       {
         const std::string effect = nhl::LoadFfxEffect(/*fallback=*/"bilinear");
+#if defined(REX_HAS_FIDELITYFX_SDK)
         if (effect != "bilinear") {
           REXCVAR_SET(present_effect, effect);
           REXCVAR_SET(present_cas_additional_sharpness,
@@ -319,11 +380,18 @@ class NhllegacyApp : public rex::ReXApp {
                       nhl::LoadFfxFsrSharpness(REXCVAR_GET(present_fsr_sharpness_reduction)));
           REXLOG_INFO("[nhl-vk-ffx] present effect '{}'", effect);
         }
-      }
+#else
+        if (effect != "bilinear") {
+          REXLOG_INFO("[nhl-vk-ffx] ini requests '{}' but this build has no FidelityFX "
+                      "(ignored; use supersampling for quality)",
+                      effect);
+        }
 #endif
+      }
 
-      // Color-grade post-process. Hot-reloadable, but the persisted overlay look
-      // is applied here so it's live from the first frame. No-op unless enabled.
+      // Color-grade / shadow cvars live in the NHL-patched SDK (Windows release
+      // and linux/ build both apply docs/rexglue-vulkan-nhl-legacy.patch).
+#if defined(_WIN32)
       if (nhl::LoadGradeEnable(/*fallback=*/false)) {
         REXCVAR_SET(present_grade_enable, true);
         REXCVAR_SET(present_grade_exposure, nhl::LoadGradeExposure(0.0));
@@ -335,11 +403,8 @@ class NhllegacyApp : public rex::ReXApp {
         REXCVAR_SET(present_grade_tonemap, nhl::LoadGradeTonemap(0.0));
         REXLOG_INFO("[nhl-vk-grade] color grade enabled from persisted settings");
       }
+#endif
 
-      // Soften shadows: restore bilinear filtering on the guest's depth/shadow
-      // maps to reduce the hard, pixelated "striped" look up close. Hot-reloadable
-      // (read per-draw in the texture cache), so applying the persisted choice here
-      // just makes it live from the first frame. NHL_VK_SHADOW_FILTER env overrides.
       {
         bool soften = nhl::LoadShadowFilterLinear(REXCVAR_GET(shadow_filter_linear));
         if (const char* sf = std::getenv("NHL_VK_SHADOW_FILTER"); sf && *sf) {
@@ -350,8 +415,6 @@ class NhllegacyApp : public rex::ReXApp {
           REXLOG_INFO("[nhl-vk-shadow] bilinear shadow filtering enabled");
         }
 
-        // Extra depth-domain blur passes (0 = off). Hot-reloadable; NHL_VK_SHADOW_BLUR
-        // env overrides the persisted choice.
         int softness = nhl::LoadShadowSoftness(REXCVAR_GET(shadow_softness));
         if (const char* sb = std::getenv("NHL_VK_SHADOW_BLUR"); sb && *sb) {
           softness = int(std::strtol(sb, nullptr, 10));
@@ -365,6 +428,7 @@ class NhllegacyApp : public rex::ReXApp {
       }
     }
 #endif
+#if defined(_WIN32)
     // Opt-in D3D12 debug layer (NHL_BETA_D3D12_DEBUG): must be set before the
     // provider creates the device. Used to get the exact device-removal reason
     // while debugging the beta owned-draw path.
@@ -372,6 +436,7 @@ class NhllegacyApp : public rex::ReXApp {
       REXCVAR_SET(d3d12_debug, true);
       REXLOG_INFO("[nhl-beta] D3D12 debug layer enabled via NHL_BETA_D3D12_DEBUG");
     }
+#endif
     // Opt-in verbose SDK logging (NHL_LOG_LEVEL=debug|trace): surfaces the texture
     // cache's per-texture create/load actions (TextureKey::LogAction) for diagnosing
     // textures that bind but sample zero.
@@ -382,6 +447,7 @@ class NhllegacyApp : public rex::ReXApp {
       rex::SetAllLevels(spdlog::level::from_str(lvl));
       REXLOG_INFO("[nhl-beta] log_level={} via NHL_LOG_LEVEL", lvl);
     }
+#if defined(_WIN32)
     // Force the BINDFUL descriptor path under the beta backend. The base
     // D3D12CommandProcessor (which owns root-signature creation) otherwise picks
     // bindless on capable HW (RTX 4080), so ConfigurePipeline hands our owned
@@ -393,26 +459,18 @@ class NhllegacyApp : public rex::ReXApp {
     if (const char* be = std::getenv("NHL_BACKEND"); be && std::strcmp(be, "beta") == 0) {
       REXCVAR_SET(d3d12_bindless, false);
       REXLOG_INFO("[nhl-beta] forcing bindful descriptor path (d3d12_bindless=false) for beta");
-      // Synchronous pipeline creation (0 creation threads) for beta: the owned-draw
-      // takeover otherwise hit an async PSO-creation race (device-removal crash, and
-      // root-sig/PSO id=201 mismatches) because the async thread read register state
-      // after our per-draw MSAA override was restored. Synchronous = built inline,
-      // deterministic. Override with NHL_BETA_PSO_SYNC=<n> for experiments.
       int32_t pso_threads = 0;
       if (const char* v = std::getenv("NHL_BETA_PSO_SYNC")) {
         pso_threads = int32_t(std::strtol(v, nullptr, 10));
       }
       REXCVAR_SET(d3d12_pipeline_creation_threads, pso_threads);
       REXLOG_INFO("[nhl-beta] d3d12_pipeline_creation_threads = {}", pso_threads);
-      // Disable sparse/tiled shared memory for beta (full 512 MB buffer). Under
-      // RenderDoc (which forces this off) the textured root sig was built correctly
-      // (8 params) and the id=708 race disappeared — the sparse-buffer path appears
-      // to perturb the shader binding-population timing. NHL_BETA_TILED=1 to re-enable.
       if (!std::getenv("NHL_BETA_TILED")) {
         REXCVAR_SET(d3d12_tiled_shared_memory, false);
         REXLOG_INFO("[nhl-beta] d3d12_tiled_shared_memory = false (full buffer)");
       }
     }
+#endif
   }
 
   // End-user installs assembled by tools/packager ship game data in a
@@ -562,7 +620,7 @@ class NhllegacyApp : public rex::ReXApp {
       __llvm_profile_write_file();  // capture the PGO profile before hard-exit
 #endif
       rex::ShutdownLogging();
-      ::TerminateProcess(::GetCurrentProcess(), 0u);
+      nhllegacy_detail::fast_exit(0u);
     };
     // Live engine-tunable store (World B). Built lazily on a worker thread when
     // the overlay's "Engine Tunables" section is first opened (the scan is only
@@ -586,7 +644,7 @@ class NhllegacyApp : public rex::ReXApp {
           delay_ms = static_cast<unsigned>(strtoul(d, nullptr, 0));
         auto* store = tunable_store_.get();
         std::thread([store, delay_ms]() {
-          ::Sleep(delay_ms);
+          nhllegacy_detail::sleep_ms(delay_ms);
           store->RequestBuild();  // applies persisted overrides on completion
         }).detach();
       }
@@ -635,11 +693,11 @@ class NhllegacyApp : public rex::ReXApp {
     if (const char* s = std::getenv("NHL_PGO_DUMP_AFTER"); s && *s) {
       const unsigned secs = static_cast<unsigned>(std::strtoul(s, nullptr, 10));
       std::thread([secs]() {
-        ::Sleep(secs * 1000u);
+        nhllegacy_detail::sleep_ms(secs * 1000u);
         std::fprintf(stderr, "[nhl-pgo] auto-dumping profile after %u s\n", secs);
         __llvm_profile_write_file();
         rex::ShutdownLogging();
-        ::TerminateProcess(::GetCurrentProcess(), 0u);
+        nhllegacy_detail::fast_exit(0u);
       }).detach();
     }
 #endif
@@ -668,10 +726,10 @@ class NhllegacyApp : public rex::ReXApp {
         std::thread([vbase, out, delay_ms]() {
           std::fprintf(stderr, "[ovr-rt] waiting %u ms for tweak registration...\n",
                        delay_ms);
-          ::Sleep(delay_ms);
+          nhllegacy_detail::sleep_ms(delay_ms);
           nhllegacy::DumpOverallWeightsRuntime(vbase, out.c_str());
           rex::ShutdownLogging();
-          ::TerminateProcess(::GetCurrentProcess(), 0u);
+          nhllegacy_detail::fast_exit(0u);
         }).detach();
       } else {
         std::fprintf(stderr, "[ovr-rt] no memory base; cannot scan\n");
@@ -716,7 +774,7 @@ class NhllegacyApp : public rex::ReXApp {
                          loaded ? "anim data detected" : "TIMEOUT (scanning anyway)");
             nhllegacy::RunAnimScan(vbase, out.c_str());
             rex::ShutdownLogging();
-            ::TerminateProcess(::GetCurrentProcess(), 0u);
+            nhllegacy_detail::fast_exit(0u);
           }).detach();
         } else {
           std::fprintf(stderr, "[anim-scan] no membase; cannot scan\n");
@@ -726,7 +784,7 @@ class NhllegacyApp : public rex::ReXApp {
       }
       const bool ok = nhllegacy::RunAnimDecode(runtime()->memory(), ad);
       rex::ShutdownLogging();
-      ::TerminateProcess(::GetCurrentProcess(), ok ? 0u : 1u);
+      nhllegacy_detail::fast_exit(ok ? 0u : 1u);
     }
 
     // NHL_DUMP_IMAGE: write the decompressed guest image (.rodata/.data/.text,
@@ -756,7 +814,7 @@ class NhllegacyApp : public rex::ReXApp {
         std::fprintf(stderr, "[img-dump] no graphics/memory system available\n");
       }
       rex::ShutdownLogging();
-      ::TerminateProcess(::GetCurrentProcess(), 0u);
+      nhllegacy_detail::fast_exit(0u);
     }
 
     if (const char* dump = std::getenv("NHL_DUMP_OVERALL_WEIGHTS"); dump && *dump) {
@@ -774,7 +832,7 @@ class NhllegacyApp : public rex::ReXApp {
         std::fprintf(stderr, "[ovr-dump] no graphics/memory system available\n");
       }
       rex::ShutdownLogging();
-      ::TerminateProcess(::GetCurrentProcess(), 0u);
+      nhllegacy_detail::fast_exit(0u);
     }
 
     // NHL_DUMP_TUNABLES: enumerate the engine tweak-registration pool(s) from
@@ -800,7 +858,7 @@ class NhllegacyApp : public rex::ReXApp {
         std::fprintf(stderr, "[tunables] no graphics/memory system available\n");
       }
       rex::ShutdownLogging();
-      ::TerminateProcess(::GetCurrentProcess(), 0u);
+      nhllegacy_detail::fast_exit(0u);
     }
 
     // NHL_DUMP_TUNABLES_RUNTIME: let the guest boot so its tweak registration
@@ -824,11 +882,11 @@ class NhllegacyApp : public rex::ReXApp {
         std::thread([vbase, txt, json, catalog, delay_ms]() {
           std::fprintf(stderr, "[tunables-rt] waiting %u ms for tweak registration...\n",
                        delay_ms);
-          ::Sleep(delay_ms);
+          nhllegacy_detail::sleep_ms(delay_ms);
           nhllegacy::DumpTunableValuesRuntime(vbase, txt.c_str(), json.c_str(),
                                               catalog.c_str());
           rex::ShutdownLogging();
-          ::TerminateProcess(::GetCurrentProcess(), 0u);
+          nhllegacy_detail::fast_exit(0u);
         }).detach();
       } else {
         std::fprintf(stderr, "[tunables-rt] no memory base; cannot scan\n");
@@ -867,7 +925,7 @@ class NhllegacyApp : public rex::ReXApp {
         // (Normal game runs are unaffected: this branch is only taken under
         // NHL_REPLAY_XTR.)
         rex::ShutdownLogging();
-        ::TerminateProcess(::GetCurrentProcess(), ok ? 0u : 1u);
+        nhllegacy_detail::fast_exit(ok ? 0u : 1u);
       });
     });
   }
