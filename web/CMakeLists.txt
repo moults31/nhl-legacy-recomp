@@ -33,6 +33,7 @@ target_link_options(nhllegacy_recomp PRIVATE -pthread)
 # ----- executable -----
 set(WASM_SOURCES
   ${WASM_SRC}/runtime_stubs.cpp
+  ${WASM_SRC}/kernel_stubs.cpp
   ${WASM_SRC}/windowed_app_context_html5.cpp
 )
 
