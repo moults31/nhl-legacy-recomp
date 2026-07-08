@@ -47,9 +47,56 @@ __attribute__((weak, noinline)) void __imp__ExAllocatePoolWithTag(PPCContext& ct
   ctx.r3.u64 = 0u;
 }
 __attribute__((weak, noinline)) void __imp__ExCreateThread(PPCContext& ctx, uint8_t* base) {
-  (void)base;
-  STUB_LOG("__imp__ExCreateThread");
-  ctx.r3.u64 = 0u;
+  // PPC calling convention: r3 = pointer to creation params struct in guest memory
+  // The start_address is at offset 0x150 in the guest KTHREAD/CreationParams.
+  // Read it and call the start function directly — this is how the kernel boots the game.
+  uint32_t params_ptr = (uint32_t)ctx.r3.u32;
+  // Try the expected offset for start_address in X_KTHREAD (0x150)
+  uint32_t start_addr = 0;
+  uint32_t xapi_startup = 0;
+  if (params_ptr >= 0x1000) {
+    start_addr = __builtin_bswap32(*(volatile uint32_t*)(base + params_ptr + 0x150));
+    xapi_startup = __builtin_bswap32(*(volatile uint32_t*)(base + params_ptr + 0x14C));
+  }
+  std::fprintf(stderr, "[wasm] ExCreateThread(params=0x%08X, start=0x%08X, xapi=0x%08X)\n",
+               params_ptr, start_addr, xapi_startup);
+
+  if (xapi_startup) {
+    // Call the Xapi thread startup trampoline, passing start_addr as argument
+    auto* fn = rex::runtime::ResolveIndirectFunction(xapi_startup);
+    if (fn) {
+      PPCContext tctx{};
+      std::memset(&tctx, 0, sizeof(tctx));
+      tctx.r1.u64 = 0x40000000ull;
+      tctx.r13.u64 = 0x10000000ull;
+      tctx.r3.u64 = start_addr;
+      tctx.fpscr.InitHost();
+      std::fprintf(stderr, "[wasm] → calling xapi_startup at 0x%08X with start=0x%08X\n",
+                   xapi_startup, start_addr);
+      fn(tctx, base);
+      ctx.r3.u64 = 0;
+    } else {
+      ctx.r3.u64 = 0xC0000001; // STATUS_UNSUCCESSFUL
+    }
+  } else if (start_addr) {
+    // Direct thread start — call the start function
+    auto* fn = rex::runtime::ResolveIndirectFunction(start_addr);
+    if (fn) {
+      PPCContext tctx{};
+      std::memset(&tctx, 0, sizeof(tctx));
+      tctx.r1.u64 = 0x40000000ull;
+      tctx.r13.u64 = 0x10000000ull;
+      tctx.fpscr.InitHost();
+      std::fprintf(stderr, "[wasm] → calling thread start at 0x%08X\n", start_addr);
+      fn(tctx, base);
+      ctx.r3.u64 = 0;
+    } else {
+      ctx.r3.u64 = 0xC0000001;
+    }
+  } else {
+    STUB_LOG("__imp__ExCreateThread");
+    ctx.r3.u64 = 0u;
+  }
 }
 __attribute__((weak, noinline)) void __imp__ExFreePool(PPCContext& ctx, uint8_t* base) {
   (void)base;

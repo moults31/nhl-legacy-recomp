@@ -41,10 +41,8 @@
 // Code section lives at 0x82450000..0x839E3530
 // Dispatch table at 0x82000000 + 0x1EA0000 = 0x83EA0000
 // Table size = code_size * 2 + thunk_reserve * 2 ≈ 0x2A9CA60
-// Dispatch table is at image_base + image_size = 0x83EA0000
-// Table size = code_size * 2 + 0x20000 ≈ 0x2A9CA60
-// Max address = 0x83EA0000 + 0x2A9CA60 ≈ 0x8693CA60 (~2.25 GB)
-static constexpr size_t kGuestMaxOffset = 0x88000000ull;
+// 3 GB covers most of the 4 GB space. OOB beyond this is rare.
+static constexpr size_t kGuestMaxOffset = 0xC0000000ull;
 static uint8_t* g_guest_base = nullptr;
 static std::atomic<bool> g_mem_logged{false};
 
@@ -123,12 +121,23 @@ class WamFunctionDispatcher {
 
 namespace rex::runtime {
 
+static void __wasm_trap_handler(PPCContext& ctx, uint8_t* base) {
+  (void)base;
+  static std::atomic<unsigned> _cnt{0};
+  auto n = _cnt.fetch_add(1, std::memory_order_relaxed);
+  if (n < 3) std::fprintf(stderr, "[sdk] TRAP (#%u) → STATUS_UNSUCCESSFUL\n", n + 1);
+  ctx.r3.u64 = 0xC0000001u;
+}
+
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
   auto* d = WamFunctionDispatcher::instance();
-  if (!d) return nullptr;
+  if (!d) return &__wasm_trap_handler;
   PPCFunc* f = d->Get(guest_address);
   if (!f) {
-    std::fprintf(stderr, "[sdk] unresolved indirect: 0x%08X\n", guest_address);
+    static std::atomic<unsigned> _cnt{0};
+    auto n = _cnt.fetch_add(1, std::memory_order_relaxed);
+    if (n < 3) std::fprintf(stderr, "[sdk] unresolved indirect: 0x%08X (#%u)\n", guest_address, n + 1);
+    return &__wasm_trap_handler;
   }
   return f;
 }
@@ -145,11 +154,16 @@ namespace rex {
 void InitLoggingEarly() {}
 void ShutdownLogging() {}
 void SetAllLevels(spdlog::level::level_enum) {}
-}  // namespace rex
-
-namespace rex::log {
+LogCategoryId RegisterLogCategory(const char* name) {
+  static std::atomic<unsigned> _c{0};
+  auto n = _c.fetch_add(1, std::memory_order_relaxed);
+  if (n < 3) std::fprintf(stderr, "[sdk] RegisterLogCategory: %s (#%u)\n", name, n + 1);
+  return LogCategoryId(n + 1);
+}
 spdlog::logger* GetLoggerRaw(LogCategoryId) { return nullptr; }
-}  // namespace rex::log
+std::shared_ptr<spdlog::logger> GetLogger(LogCategoryId) { return nullptr; }
+std::shared_ptr<spdlog::logger> GetLogger() { return nullptr; }
+}  // namespace rex
 
 // ---- Debug (declared in rex/dbg.h, not inline) -----------------------------
 
@@ -267,8 +281,8 @@ extern "C" int wasm_boot_guest() {
 
   PPCContext ctx{};
   std::memset(&ctx, 0, sizeof(ctx));
-  ctx.r1.u64 = 0x100000000ull - 0x10000ull;
-  ctx.r13.u64 = 0x10000000ull;
+  ctx.r1.u64 = 0x40000000ull;  // 1 GB into guest space — must be inside our buffer
+  ctx.r13.u64 = 0x10000000ull; // TLS base
   ctx.fpscr.InitHost();
 
   std::fprintf(stderr, "[sdk] calling entry 0x%llX (r1=%llX r13=%llX)\n",
@@ -277,8 +291,22 @@ extern "C" int wasm_boot_guest() {
                (unsigned long long)ctx.r13.u64);
 
   entry(ctx, base);
-
   std::fprintf(stderr, "[sdk] guest entry returned r3=0x%llX\n",
                (unsigned long long)ctx.r3.u64);
+
+  // Probe ONE function at a time — the first function after the entry.
+  // The entry (0x82450000) runs fine. Next is 0x82451038.
+  uint32_t next = 0x82451038;
+  auto* f2 = disp->Get(next);
+  if (f2) {
+    PPCContext pctx{};
+    std::memset(&pctx, 0, sizeof(pctx));
+    pctx.r1.u64 = 0x40000000ull;
+    pctx.r13.u64 = 0x10000000ull;
+    pctx.fpscr.InitHost();
+    std::fprintf(stderr, "[sdk] calling 0x%08X...\n", next);
+    f2(pctx, base);
+    std::fprintf(stderr, "[sdk] 0x%08X returned r3=0x%llX\n", next, (unsigned long long)pctx.r3.u64);
+  }
   return 0;
 }
