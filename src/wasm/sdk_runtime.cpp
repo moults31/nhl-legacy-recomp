@@ -475,6 +475,11 @@ extern "C" int wasm_boot_guest() {
     0x836F9020,  // TU 160 function
     0x836F9070,  // TU 160 function
     0x836F90F8,  // TU 160 function
+    0x836F5B40,  // TU 160 function
+    0x836F5BE8,  // TU 160 function
+    0x836F5CB0,  // TU 160 function
+    0x836F6228,  // TU 160 function
+    0x836F65A0,  // TU 160 function
     0, };
   for (auto* p = boot_chain; *p; ++p) {
     auto* f = disp->Get(*p);
