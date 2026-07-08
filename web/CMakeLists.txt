@@ -17,10 +17,13 @@ set(NHL_WASM_INCLUDES
   "${PATCH_DIR}"
   "${GENERATED_DIR}"
   "${SDK_DIR}/include"
+  "${SDK_DIR}/src"       # SDK internal headers
   "${SDK_DIR}/thirdparty/simde"
   "${SDK_DIR}/thirdparty/fmt/include"
   "${SDK_DIR}/thirdparty/spdlog/include"
   "${SDK_DIR}/thirdparty/tomlplusplus/include"
+  "${SDK_DIR}/thirdparty/crypto"
+  "${SDK_DIR}/thirdparty"       # for "crypto/TinySHA1.hpp" include paths
 )
 
 # ----- generated recomp library -----
@@ -58,7 +61,7 @@ target_link_options(nhllegacy PRIVATE
   -sWASM_BIGINT
   -sALLOW_MEMORY_GROWTH=1
   -sMAXIMUM_MEMORY=4294967296
-  -sINITIAL_MEMORY=3221225472
+  -sINITIAL_MEMORY=3758096384
   -sSTACK_SIZE=4MB
   -sERROR_ON_UNDEFINED_SYMBOLS=0
   -Wl,--allow-undefined

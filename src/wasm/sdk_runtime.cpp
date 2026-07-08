@@ -42,7 +42,7 @@
 // Dispatch table at 0x82000000 + 0x1EA0000 = 0x83EA0000
 // Table size = code_size * 2 + thunk_reserve * 2 ≈ 0x2A9CA60
 // 3 GB covers most of the 4 GB space. OOB beyond this is rare.
-static constexpr size_t kGuestMaxOffset = 0xC0000000ull;
+static constexpr size_t kGuestMaxOffset = 0xD0000000ull; // ~3.25 GB
 static uint8_t* g_guest_base = nullptr;
 static std::atomic<bool> g_mem_logged{false};
 
@@ -253,6 +253,9 @@ const rex::PPCImageInfo PPCImageConfig = {
 };
 }
 
+// Forward declaration
+static void preload_data_sections(uint8_t* base);
+
 // ============================================================================
 // Boot — called from main().  Builds the dispatch table, sets up PPC context,
 // and calls the guest kernel entry point.
@@ -272,6 +275,18 @@ extern "C" int wasm_boot_guest() {
     return 1;
   }
 
+  // Pre-populate .rdata/.data sections with function pointers from the manifest.
+  std::fprintf(stderr, "[sdk] loading data section init...\n");
+  preload_data_sections(base);
+
+
+  // Create a fake module handle at guest address 0x11000000.
+  const uint32_t kMod = 0x11000000;
+  auto* mod = reinterpret_cast<volatile uint32_t*>(base + kMod);
+  mod[0] = __builtin_bswap32(0x82450000);
+  mod[1] = __builtin_bswap32(kMod + 16);
+  mod[2] = __builtin_bswap32(kMod + 32);
+
   PPCFunc* entry = disp->Get(static_cast<uint32_t>(PPCImageConfig.code_base));
   if (!entry) {
     std::fprintf(stderr, "[sdk] FATAL: entry 0x%llX not registered\n",
@@ -281,6 +296,7 @@ extern "C" int wasm_boot_guest() {
 
   PPCContext ctx{};
   std::memset(&ctx, 0, sizeof(ctx));
+  ctx.r3.u64 = kMod;
   ctx.r1.u64 = 0x40000000ull;  // 1 GB into guest space — must be inside our buffer
   ctx.r13.u64 = 0x10000000ull; // TLS base
   ctx.fpscr.InitHost();
@@ -294,19 +310,378 @@ extern "C" int wasm_boot_guest() {
   std::fprintf(stderr, "[sdk] guest entry returned r3=0x%llX\n",
                (unsigned long long)ctx.r3.u64);
 
-  // Probe ONE function at a time — the first function after the entry.
-  // The entry (0x82450000) runs fine. Next is 0x82451038.
-  uint32_t next = 0x82451038;
-  auto* f2 = disp->Get(next);
-  if (f2) {
+  // Probe the init chain — call more functions with the proper module handle.
+  static const uint32_t init_chain[] = {
+    0x82451038, 0x82451160, 0x82452620, 0x82452DC8, 0x82453280,
+    0x82456000, 0x82458000, 0x8245A000, 0, };
+  for (auto* p = init_chain; *p; ++p) {
+    auto* f = disp->Get(*p);
+    if (!f) continue;
     PPCContext pctx{};
     std::memset(&pctx, 0, sizeof(pctx));
+    pctx.r3.u64 = kMod;  // pass the fake module handle
     pctx.r1.u64 = 0x40000000ull;
     pctx.r13.u64 = 0x10000000ull;
     pctx.fpscr.InitHost();
-    std::fprintf(stderr, "[sdk] calling 0x%08X...\n", next);
-    f2(pctx, base);
-    std::fprintf(stderr, "[sdk] 0x%08X returned r3=0x%llX\n", next, (unsigned long long)pctx.r3.u64);
+    f(pctx, base);
+    std::fprintf(stderr, "[sdk] 0x%08X → r3=0x%llX\n", *p, (unsigned long long)pctx.r3.u64);
   }
   return 0;
+}
+// Auto-generated: 354 data section initializers from nhllegacy_functions.toml
+static void preload_data_sections(uint8_t* base) {
+  *((volatile uint32_t*)(base + 0x83B4B15C)) = __builtin_bswap32(2185793856u);  // -> 0x82489140
+  *((volatile uint32_t*)(base + 0x83B4B1F8)) = __builtin_bswap32(2185806224u);  // -> 0x8248C190
+  *((volatile uint32_t*)(base + 0x83B4B1FC)) = __builtin_bswap32(2185806280u);  // -> 0x8248C1C8
+  *((volatile uint32_t*)(base + 0x83B4B200)) = __builtin_bswap32(2185806280u);  // -> 0x8248C1C8
+  *((volatile uint32_t*)(base + 0x823302B8)) = __builtin_bswap32(2185862880u);  // -> 0x82499EE0
+  *((volatile uint32_t*)(base + 0x82332E1C)) = __builtin_bswap32(2186025624u);  // -> 0x824C1A98
+  *((volatile uint32_t*)(base + 0x82332E88)) = __builtin_bswap32(2186027832u);  // -> 0x824C2338
+  *((volatile uint32_t*)(base + 0x82332E84)) = __builtin_bswap32(2186027912u);  // -> 0x824C2388
+  *((volatile uint32_t*)(base + 0x82332E78)) = __builtin_bswap32(2186028224u);  // -> 0x824C24C0
+  *((volatile uint32_t*)(base + 0x82332E74)) = __builtin_bswap32(2186028304u);  // -> 0x824C2510
+  *((volatile uint32_t*)(base + 0x82332E70)) = __builtin_bswap32(2186028384u);  // -> 0x824C2560
+  *((volatile uint32_t*)(base + 0x82349EC4)) = __builtin_bswap32(2186077216u);  // -> 0x824CE420
+  *((volatile uint32_t*)(base + 0x823346B0)) = __builtin_bswap32(2186097616u);  // -> 0x824D33D0
+  *((volatile uint32_t*)(base + 0x823348A8)) = __builtin_bswap32(2186206344u);  // -> 0x824EDC88
+  *((volatile uint32_t*)(base + 0x823349B8)) = __builtin_bswap32(2186206392u);  // -> 0x824EDCB8
+  *((volatile uint32_t*)(base + 0x82334A38)) = __builtin_bswap32(2186206432u);  // -> 0x824EDCE0
+  *((volatile uint32_t*)(base + 0x8233498C)) = __builtin_bswap32(2186206456u);  // -> 0x824EDCF8
+  *((volatile uint32_t*)(base + 0x82349C58)) = __builtin_bswap32(2186670432u);  // -> 0x8255F160
+  *((volatile uint32_t*)(base + 0x82349ED8)) = __builtin_bswap32(2186683064u);  // -> 0x825622B8
+  *((volatile uint32_t*)(base + 0x8234987C)) = __builtin_bswap32(2186683424u);  // -> 0x82562420
+  *((volatile uint32_t*)(base + 0x82349DB8)) = __builtin_bswap32(2186683424u);  // -> 0x82562420
+  *((volatile uint32_t*)(base + 0x823497A4)) = __builtin_bswap32(2186683576u);  // -> 0x825624B8
+  *((volatile uint32_t*)(base + 0x8234B534)) = __builtin_bswap32(2186712440u);  // -> 0x82569578
+  *((volatile uint32_t*)(base + 0x8234D238)) = __builtin_bswap32(2186988176u);  // -> 0x825ACA90
+  *((volatile uint32_t*)(base + 0x8234E038)) = __builtin_bswap32(2187136520u);  // -> 0x825D0E08
+  *((volatile uint32_t*)(base + 0x8234E128)) = __builtin_bswap32(2187136520u);  // -> 0x825D0E08
+  *((volatile uint32_t*)(base + 0x82391600)) = __builtin_bswap32(2187731568u);  // -> 0x82662270
+  *((volatile uint32_t*)(base + 0x82393000)) = __builtin_bswap32(2187808448u);  // -> 0x82674EC0
+  *((volatile uint32_t*)(base + 0x82392FF8)) = __builtin_bswap32(2187809648u);  // -> 0x82675370
+  *((volatile uint32_t*)(base + 0x82392FF4)) = __builtin_bswap32(2187809672u);  // -> 0x82675388
+  *((volatile uint32_t*)(base + 0x82393008)) = __builtin_bswap32(2187809672u);  // -> 0x82675388
+  *((volatile uint32_t*)(base + 0x83B3BA90)) = __builtin_bswap32(2188093864u);  // -> 0x826BA9A8
+  *((volatile uint32_t*)(base + 0x83B3BB54)) = __builtin_bswap32(2188093864u);  // -> 0x826BA9A8
+  *((volatile uint32_t*)(base + 0x8239AE94)) = __builtin_bswap32(2188355424u);  // -> 0x826FA760
+  *((volatile uint32_t*)(base + 0x8239AE98)) = __builtin_bswap32(2188355448u);  // -> 0x826FA778
+  *((volatile uint32_t*)(base + 0x83B3AA20)) = __builtin_bswap32(2188784136u);  // -> 0x82763208
+  *((volatile uint32_t*)(base + 0x823A5940)) = __builtin_bswap32(2189054384u);  // -> 0x827A51B0
+  *((volatile uint32_t*)(base + 0x823A9A34)) = __builtin_bswap32(2189501936u);  // -> 0x828125F0
+  *((volatile uint32_t*)(base + 0x822F64FC)) = __builtin_bswap32(2189800680u);  // -> 0x8285B4E8
+  *((volatile uint32_t*)(base + 0x823B01C8)) = __builtin_bswap32(2190064992u);  // -> 0x8289BD60
+  *((volatile uint32_t*)(base + 0x823B0210)) = __builtin_bswap32(2190071092u);  // -> 0x8289D534
+  *((volatile uint32_t*)(base + 0x823B0220)) = __builtin_bswap32(2190071468u);  // -> 0x8289D6AC
+  *((volatile uint32_t*)(base + 0x823B0260)) = __builtin_bswap32(2190074348u);  // -> 0x8289E1EC
+  *((volatile uint32_t*)(base + 0x820144D0)) = __builtin_bswap32(2190101568u);  // -> 0x828A4C40
+  *((volatile uint32_t*)(base + 0x820144D4)) = __builtin_bswap32(2190101592u);  // -> 0x828A4C58
+  *((volatile uint32_t*)(base + 0x820144D8)) = __builtin_bswap32(2190101616u);  // -> 0x828A4C70
+  *((volatile uint32_t*)(base + 0x8201CB68)) = __builtin_bswap32(2190219176u);  // -> 0x828C17A8
+  *((volatile uint32_t*)(base + 0x82022740)) = __builtin_bswap32(2190595768u);  // -> 0x8291D6B8
+  *((volatile uint32_t*)(base + 0x82037A5C)) = __builtin_bswap32(2191032680u);  // -> 0x82988168
+  *((volatile uint32_t*)(base + 0x82046E20)) = __builtin_bswap32(2191278832u);  // -> 0x829C42F0
+  *((volatile uint32_t*)(base + 0x82046E2C)) = __builtin_bswap32(2191278840u);  // -> 0x829C42F8
+  *((volatile uint32_t*)(base + 0x82046EA4)) = __builtin_bswap32(2191281912u);  // -> 0x829C4EF8
+  *((volatile uint32_t*)(base + 0x82046EA8)) = __builtin_bswap32(2191281920u);  // -> 0x829C4F00
+  *((volatile uint32_t*)(base + 0x82046EAC)) = __builtin_bswap32(2191281928u);  // -> 0x829C4F08
+  *((volatile uint32_t*)(base + 0x82046EB0)) = __builtin_bswap32(2191281936u);  // -> 0x829C4F10
+  *((volatile uint32_t*)(base + 0x82046EB4)) = __builtin_bswap32(2191281944u);  // -> 0x829C4F18
+  *((volatile uint32_t*)(base + 0x82046EB8)) = __builtin_bswap32(2191281952u);  // -> 0x829C4F20
+  *((volatile uint32_t*)(base + 0x82046EBC)) = __builtin_bswap32(2191281960u);  // -> 0x829C4F28
+  *((volatile uint32_t*)(base + 0x82046EC0)) = __builtin_bswap32(2191281968u);  // -> 0x829C4F30
+  *((volatile uint32_t*)(base + 0x82046EC8)) = __builtin_bswap32(2191281984u);  // -> 0x829C4F40
+  *((volatile uint32_t*)(base + 0x82046ECC)) = __builtin_bswap32(2191281992u);  // -> 0x829C4F48
+  *((volatile uint32_t*)(base + 0x82046ED8)) = __builtin_bswap32(2191282016u);  // -> 0x829C4F60
+  *((volatile uint32_t*)(base + 0x82046E80)) = __builtin_bswap32(2191282024u);  // -> 0x829C4F68
+  *((volatile uint32_t*)(base + 0x82046F14)) = __builtin_bswap32(2191282328u);  // -> 0x829C5098
+  *((volatile uint32_t*)(base + 0x82046F18)) = __builtin_bswap32(2191282344u);  // -> 0x829C50A8
+  *((volatile uint32_t*)(base + 0x82047B5C)) = __builtin_bswap32(2191315128u);  // -> 0x829CD0B8
+  *((volatile uint32_t*)(base + 0x82047B78)) = __builtin_bswap32(2191315272u);  // -> 0x829CD148
+  *((volatile uint32_t*)(base + 0x82047B84)) = __builtin_bswap32(2191315336u);  // -> 0x829CD188
+  *((volatile uint32_t*)(base + 0x82047B8C)) = __builtin_bswap32(2191315592u);  // -> 0x829CD288
+  *((volatile uint32_t*)(base + 0x82047B94)) = __builtin_bswap32(2191315600u);  // -> 0x829CD290
+  *((volatile uint32_t*)(base + 0x8204A784)) = __builtin_bswap32(2191416680u);  // -> 0x829E5D68
+  *((volatile uint32_t*)(base + 0x8204A80C)) = __builtin_bswap32(2191416696u);  // -> 0x829E5D78
+  *((volatile uint32_t*)(base + 0x8204A840)) = __builtin_bswap32(2191416920u);  // -> 0x829E5E58
+  *((volatile uint32_t*)(base + 0x8204A84C)) = __builtin_bswap32(2191416944u);  // -> 0x829E5E70
+  *((volatile uint32_t*)(base + 0x8204A8A8)) = __builtin_bswap32(2191416960u);  // -> 0x829E5E80
+  *((volatile uint32_t*)(base + 0x8205A3EC)) = __builtin_bswap32(2191657752u);  // -> 0x82A20B18
+  *((volatile uint32_t*)(base + 0x8208B3BC)) = __builtin_bswap32(2191657752u);  // -> 0x82A20B18
+  *((volatile uint32_t*)(base + 0x820EBAF4)) = __builtin_bswap32(2191657752u);  // -> 0x82A20B18
+  *((volatile uint32_t*)(base + 0x8205A3FC)) = __builtin_bswap32(2191657768u);  // -> 0x82A20B28
+  *((volatile uint32_t*)(base + 0x820807B4)) = __builtin_bswap32(2191657768u);  // -> 0x82A20B28
+  *((volatile uint32_t*)(base + 0x8208B3CC)) = __builtin_bswap32(2191657768u);  // -> 0x82A20B28
+  *((volatile uint32_t*)(base + 0x820667F4)) = __builtin_bswap32(2192035000u);  // -> 0x82A7CCB8
+  *((volatile uint32_t*)(base + 0x8208BEF0)) = __builtin_bswap32(2193321024u);  // -> 0x82BB6C40
+  *((volatile uint32_t*)(base + 0x82091598)) = __builtin_bswap32(2193386216u);  // -> 0x82BC6AE8
+  *((volatile uint32_t*)(base + 0x8209159C)) = __builtin_bswap32(2193386240u);  // -> 0x82BC6B00
+  *((volatile uint32_t*)(base + 0x820915A4)) = __builtin_bswap32(2193386264u);  // -> 0x82BC6B18
+  *((volatile uint32_t*)(base + 0x820915A0)) = __builtin_bswap32(2193386288u);  // -> 0x82BC6B30
+  *((volatile uint32_t*)(base + 0x820915AC)) = __builtin_bswap32(2193386328u);  // -> 0x82BC6B58
+  *((volatile uint32_t*)(base + 0x820915B4)) = __builtin_bswap32(2193386352u);  // -> 0x82BC6B70
+  *((volatile uint32_t*)(base + 0x820915B8)) = __builtin_bswap32(2193386376u);  // -> 0x82BC6B88
+  *((volatile uint32_t*)(base + 0x820915BC)) = __builtin_bswap32(2193386400u);  // -> 0x82BC6BA0
+  *((volatile uint32_t*)(base + 0x820CDAB0)) = __builtin_bswap32(2194012768u);  // -> 0x82C5FA60
+  *((volatile uint32_t*)(base + 0x8209D830)) = __builtin_bswap32(2194020072u);  // -> 0x82C616E8
+  *((volatile uint32_t*)(base + 0x820A9910)) = __builtin_bswap32(2194446840u);  // -> 0x82CC99F8
+  *((volatile uint32_t*)(base + 0x820AAA08)) = __builtin_bswap32(2194582432u);  // -> 0x82CEABA0
+  *((volatile uint32_t*)(base + 0x820ABA90)) = __builtin_bswap32(2194630024u);  // -> 0x82CF6588
+  *((volatile uint32_t*)(base + 0x820B3890)) = __builtin_bswap32(2194949936u);  // -> 0x82D44730
+  *((volatile uint32_t*)(base + 0x820B4FAC)) = __builtin_bswap32(2194994968u);  // -> 0x82D4F718
+  *((volatile uint32_t*)(base + 0x820CB520)) = __builtin_bswap32(2195641120u);  // -> 0x82DED320
+  *((volatile uint32_t*)(base + 0x820CDAFC)) = __builtin_bswap32(2195649240u);  // -> 0x82DEF2D8
+  *((volatile uint32_t*)(base + 0x820CADCC)) = __builtin_bswap32(2195657976u);  // -> 0x82DF14F8
+  *((volatile uint32_t*)(base + 0x820CDF2C)) = __builtin_bswap32(2195690288u);  // -> 0x82DF9330
+  *((volatile uint32_t*)(base + 0x820CE31C)) = __builtin_bswap32(2195690288u);  // -> 0x82DF9330
+  *((volatile uint32_t*)(base + 0x820CE4A4)) = __builtin_bswap32(2195693472u);  // -> 0x82DF9FA0
+  *((volatile uint32_t*)(base + 0x820CE51C)) = __builtin_bswap32(2195697328u);  // -> 0x82DFAEB0
+  *((volatile uint32_t*)(base + 0x820E6808)) = __builtin_bswap32(2196106920u);  // -> 0x82E5EEA8
+  *((volatile uint32_t*)(base + 0x820E680C)) = __builtin_bswap32(2196106920u);  // -> 0x82E5EEA8
+  *((volatile uint32_t*)(base + 0x820E7550)) = __builtin_bswap32(2196106920u);  // -> 0x82E5EEA8
+  *((volatile uint32_t*)(base + 0x820E869C)) = __builtin_bswap32(2196114304u);  // -> 0x82E60B80
+  *((volatile uint32_t*)(base + 0x820E86B4)) = __builtin_bswap32(2196114336u);  // -> 0x82E60BA0
+  *((volatile uint32_t*)(base + 0x820E86BC)) = __builtin_bswap32(2196114368u);  // -> 0x82E60BC0
+  *((volatile uint32_t*)(base + 0x820E86DC)) = __builtin_bswap32(2196114400u);  // -> 0x82E60BE0
+  *((volatile uint32_t*)(base + 0x820E6EE8)) = __builtin_bswap32(2196114944u);  // -> 0x82E60E00
+  *((volatile uint32_t*)(base + 0x820E6EFC)) = __builtin_bswap32(2196115104u);  // -> 0x82E60EA0
+  *((volatile uint32_t*)(base + 0x820E5E7C)) = __builtin_bswap32(2196118976u);  // -> 0x82E61DC0
+  *((volatile uint32_t*)(base + 0x820E7450)) = __builtin_bswap32(2196138896u);  // -> 0x82E66B90
+  *((volatile uint32_t*)(base + 0x820F1308)) = __builtin_bswap32(2196138896u);  // -> 0x82E66B90
+  *((volatile uint32_t*)(base + 0x820E7780)) = __builtin_bswap32(2196146672u);  // -> 0x82E689F0
+  *((volatile uint32_t*)(base + 0x820E5114)) = __builtin_bswap32(2196155008u);  // -> 0x82E6AA80
+  *((volatile uint32_t*)(base + 0x820E6994)) = __builtin_bswap32(2196155008u);  // -> 0x82E6AA80
+  *((volatile uint32_t*)(base + 0x820E50F0)) = __builtin_bswap32(2196155160u);  // -> 0x82E6AB18
+  *((volatile uint32_t*)(base + 0x820E6970)) = __builtin_bswap32(2196155160u);  // -> 0x82E6AB18
+  *((volatile uint32_t*)(base + 0x820E6E1C)) = __builtin_bswap32(2196183448u);  // -> 0x82E71998
+  *((volatile uint32_t*)(base + 0x820E8AE0)) = __builtin_bswap32(2196203688u);  // -> 0x82E768A8
+  *((volatile uint32_t*)(base + 0x820E8AD8)) = __builtin_bswap32(2196203768u);  // -> 0x82E768F8
+  *((volatile uint32_t*)(base + 0x820E8AC8)) = __builtin_bswap32(2196203832u);  // -> 0x82E76938
+  *((volatile uint32_t*)(base + 0x820E8AF0)) = __builtin_bswap32(2196203856u);  // -> 0x82E76950
+  *((volatile uint32_t*)(base + 0x820E8AF4)) = __builtin_bswap32(2196203880u);  // -> 0x82E76968
+  *((volatile uint32_t*)(base + 0x820E8AF8)) = __builtin_bswap32(2196203928u);  // -> 0x82E76998
+  *((volatile uint32_t*)(base + 0x820E8B14)) = __builtin_bswap32(2196204048u);  // -> 0x82E76A10
+  *((volatile uint32_t*)(base + 0x820E8B1C)) = __builtin_bswap32(2196204072u);  // -> 0x82E76A28
+  *((volatile uint32_t*)(base + 0x820E8B48)) = __builtin_bswap32(2196204120u);  // -> 0x82E76A58
+  *((volatile uint32_t*)(base + 0x820E8B4C)) = __builtin_bswap32(2196204144u);  // -> 0x82E76A70
+  *((volatile uint32_t*)(base + 0x820E5104)) = __builtin_bswap32(2196243560u);  // -> 0x82E80468
+  *((volatile uint32_t*)(base + 0x820E6984)) = __builtin_bswap32(2196243560u);  // -> 0x82E80468
+  *((volatile uint32_t*)(base + 0x820E69A0)) = __builtin_bswap32(2196246680u);  // -> 0x82E81098
+  *((volatile uint32_t*)(base + 0x820E699C)) = __builtin_bswap32(2196246688u);  // -> 0x82E810A0
+  *((volatile uint32_t*)(base + 0x820E6998)) = __builtin_bswap32(2196246696u);  // -> 0x82E810A8
+  *((volatile uint32_t*)(base + 0x820E6C4C)) = __builtin_bswap32(2196264160u);  // -> 0x82E854E0
+  *((volatile uint32_t*)(base + 0x820E6C74)) = __builtin_bswap32(2196264192u);  // -> 0x82E85500
+  *((volatile uint32_t*)(base + 0x820E6E78)) = __builtin_bswap32(2196275032u);  // -> 0x82E87F58
+  *((volatile uint32_t*)(base + 0x820E6E50)) = __builtin_bswap32(2196275056u);  // -> 0x82E87F70
+  *((volatile uint32_t*)(base + 0x820E6F98)) = __builtin_bswap32(2196275056u);  // -> 0x82E87F70
+  *((volatile uint32_t*)(base + 0x820E7470)) = __builtin_bswap32(2196275056u);  // -> 0x82E87F70
+  *((volatile uint32_t*)(base + 0x820E6E3C)) = __builtin_bswap32(2196275064u);  // -> 0x82E87F78
+  *((volatile uint32_t*)(base + 0x820E6F84)) = __builtin_bswap32(2196275064u);  // -> 0x82E87F78
+  *((volatile uint32_t*)(base + 0x820E745C)) = __builtin_bswap32(2196275064u);  // -> 0x82E87F78
+  *((volatile uint32_t*)(base + 0x820E6E44)) = __builtin_bswap32(2196275080u);  // -> 0x82E87F88
+  *((volatile uint32_t*)(base + 0x820E6F8C)) = __builtin_bswap32(2196275080u);  // -> 0x82E87F88
+  *((volatile uint32_t*)(base + 0x820E7464)) = __builtin_bswap32(2196275080u);  // -> 0x82E87F88
+  *((volatile uint32_t*)(base + 0x820E6E70)) = __builtin_bswap32(2196275104u);  // -> 0x82E87FA0
+  *((volatile uint32_t*)(base + 0x820E6FB8)) = __builtin_bswap32(2196275104u);  // -> 0x82E87FA0
+  *((volatile uint32_t*)(base + 0x820E6E54)) = __builtin_bswap32(2196308008u);  // -> 0x82E90028
+  *((volatile uint32_t*)(base + 0x820E6F9C)) = __builtin_bswap32(2196308008u);  // -> 0x82E90028
+  *((volatile uint32_t*)(base + 0x820E7474)) = __builtin_bswap32(2196308008u);  // -> 0x82E90028
+  *((volatile uint32_t*)(base + 0x820E6EB0)) = __builtin_bswap32(2196308016u);  // -> 0x82E90030
+  *((volatile uint32_t*)(base + 0x820E6FF8)) = __builtin_bswap32(2196308016u);  // -> 0x82E90030
+  *((volatile uint32_t*)(base + 0x820E74D0)) = __builtin_bswap32(2196308016u);  // -> 0x82E90030
+  *((volatile uint32_t*)(base + 0x820E6EB8)) = __builtin_bswap32(2196308056u);  // -> 0x82E90058
+  *((volatile uint32_t*)(base + 0x820E7000)) = __builtin_bswap32(2196308056u);  // -> 0x82E90058
+  *((volatile uint32_t*)(base + 0x820E74D8)) = __builtin_bswap32(2196308056u);  // -> 0x82E90058
+  *((volatile uint32_t*)(base + 0x820E74E4)) = __builtin_bswap32(2196308096u);  // -> 0x82E90080
+  *((volatile uint32_t*)(base + 0x820E6E64)) = __builtin_bswap32(2196308616u);  // -> 0x82E90288
+  *((volatile uint32_t*)(base + 0x820E6FAC)) = __builtin_bswap32(2196308616u);  // -> 0x82E90288
+  *((volatile uint32_t*)(base + 0x820E7484)) = __builtin_bswap32(2196308616u);  // -> 0x82E90288
+  *((volatile uint32_t*)(base + 0x820E6E5C)) = __builtin_bswap32(2196308624u);  // -> 0x82E90290
+  *((volatile uint32_t*)(base + 0x820E6FA4)) = __builtin_bswap32(2196308624u);  // -> 0x82E90290
+  *((volatile uint32_t*)(base + 0x820E747C)) = __builtin_bswap32(2196308624u);  // -> 0x82E90290
+  *((volatile uint32_t*)(base + 0x820E7490)) = __builtin_bswap32(2196308632u);  // -> 0x82E90298
+  *((volatile uint32_t*)(base + 0x820E8020)) = __builtin_bswap32(2196345224u);  // -> 0x82E99188
+  *((volatile uint32_t*)(base + 0x820E86C4)) = __builtin_bswap32(2196368904u);  // -> 0x82E9EE08
+  *((volatile uint32_t*)(base + 0x820E86C8)) = __builtin_bswap32(2196368936u);  // -> 0x82E9EE28
+  *((volatile uint32_t*)(base + 0x820E86D4)) = __builtin_bswap32(2196368968u);  // -> 0x82E9EE48
+  *((volatile uint32_t*)(base + 0x820E86D8)) = __builtin_bswap32(2196369000u);  // -> 0x82E9EE68
+  *((volatile uint32_t*)(base + 0x820E8704)) = __builtin_bswap32(2196369032u);  // -> 0x82E9EE88
+  *((volatile uint32_t*)(base + 0x820E8708)) = __builtin_bswap32(2196369064u);  // -> 0x82E9EEA8
+  *((volatile uint32_t*)(base + 0x820E870C)) = __builtin_bswap32(2196369096u);  // -> 0x82E9EEC8
+  *((volatile uint32_t*)(base + 0x820E86E0)) = __builtin_bswap32(2196369128u);  // -> 0x82E9EEE8
+  *((volatile uint32_t*)(base + 0x820E8AA4)) = __builtin_bswap32(2196380816u);  // -> 0x82EA1C90
+  *((volatile uint32_t*)(base + 0x820E8AA8)) = __builtin_bswap32(2196380840u);  // -> 0x82EA1CA8
+  *((volatile uint32_t*)(base + 0x820E8A9C)) = __builtin_bswap32(2196380864u);  // -> 0x82EA1CC0
+  *((volatile uint32_t*)(base + 0x820E8A94)) = __builtin_bswap32(2196380888u);  // -> 0x82EA1CD8
+  *((volatile uint32_t*)(base + 0x820E8AA0)) = __builtin_bswap32(2196380912u);  // -> 0x82EA1CF0
+  *((volatile uint32_t*)(base + 0x820E8AAC)) = __builtin_bswap32(2196380936u);  // -> 0x82EA1D08
+  *((volatile uint32_t*)(base + 0x820E8A98)) = __builtin_bswap32(2196380960u);  // -> 0x82EA1D20
+  *((volatile uint32_t*)(base + 0x820E8AB0)) = __builtin_bswap32(2196380984u);  // -> 0x82EA1D38
+  *((volatile uint32_t*)(base + 0x820E8AB4)) = __builtin_bswap32(2196381008u);  // -> 0x82EA1D50
+  *((volatile uint32_t*)(base + 0x820E8B68)) = __builtin_bswap32(2196381032u);  // -> 0x82EA1D68
+  *((volatile uint32_t*)(base + 0x820E8B6C)) = __builtin_bswap32(2196381056u);  // -> 0x82EA1D80
+  *((volatile uint32_t*)(base + 0x820E8B70)) = __builtin_bswap32(2196381080u);  // -> 0x82EA1D98
+  *((volatile uint32_t*)(base + 0x820E8B74)) = __builtin_bswap32(2196381104u);  // -> 0x82EA1DB0
+  *((volatile uint32_t*)(base + 0x820E8B38)) = __builtin_bswap32(2196381128u);  // -> 0x82EA1DC8
+  *((volatile uint32_t*)(base + 0x820E6B10)) = __builtin_bswap32(2196381960u);  // -> 0x82EA2108
+  *((volatile uint32_t*)(base + 0x820E8C88)) = __builtin_bswap32(2196381960u);  // -> 0x82EA2108
+  *((volatile uint32_t*)(base + 0x820F9AE4)) = __builtin_bswap32(2196381960u);  // -> 0x82EA2108
+  *((volatile uint32_t*)(base + 0x820E8DD8)) = __builtin_bswap32(2196384464u);  // -> 0x82EA2AD0
+  *((volatile uint32_t*)(base + 0x820E8E50)) = __builtin_bswap32(2196384592u);  // -> 0x82EA2B50
+  *((volatile uint32_t*)(base + 0x820E8E70)) = __builtin_bswap32(2196384768u);  // -> 0x82EA2C00
+  *((volatile uint32_t*)(base + 0x820ED6C0)) = __builtin_bswap32(2196501784u);  // -> 0x82EBF518
+  *((volatile uint32_t*)(base + 0x820F20E0)) = __builtin_bswap32(2196523824u);  // -> 0x82EC4B30
+  *((volatile uint32_t*)(base + 0x820F20E4)) = __builtin_bswap32(2196523824u);  // -> 0x82EC4B30
+  *((volatile uint32_t*)(base + 0x820EDD70)) = __builtin_bswap32(2196528472u);  // -> 0x82EC5D58
+  *((volatile uint32_t*)(base + 0x820ECC74)) = __builtin_bswap32(2196552832u);  // -> 0x82ECBC80
+  *((volatile uint32_t*)(base + 0x820ECC78)) = __builtin_bswap32(2196552904u);  // -> 0x82ECBCC8
+  *((volatile uint32_t*)(base + 0x820F13C8)) = __builtin_bswap32(2196552904u);  // -> 0x82ECBCC8
+  *((volatile uint32_t*)(base + 0x820F0024)) = __builtin_bswap32(2196564760u);  // -> 0x82ECEB18
+  *((volatile uint32_t*)(base + 0x820EFABC)) = __builtin_bswap32(2196592480u);  // -> 0x82ED5760
+  *((volatile uint32_t*)(base + 0x820EFAC8)) = __builtin_bswap32(2196592776u);  // -> 0x82ED5888
+  *((volatile uint32_t*)(base + 0x820EFB34)) = __builtin_bswap32(2196593208u);  // -> 0x82ED5A38
+  *((volatile uint32_t*)(base + 0x820EFB4C)) = __builtin_bswap32(2196593480u);  // -> 0x82ED5B48
+  *((volatile uint32_t*)(base + 0x820F00D8)) = __builtin_bswap32(2196652096u);  // -> 0x82EE4040
+  *((volatile uint32_t*)(base + 0x820EFA98)) = __builtin_bswap32(2196699568u);  // -> 0x82EEF9B0
+  *((volatile uint32_t*)(base + 0x820F031C)) = __builtin_bswap32(2196768544u);  // -> 0x82F00720
+  *((volatile uint32_t*)(base + 0x820F5EDC)) = __builtin_bswap32(2196904568u);  // -> 0x82F21A78
+  *((volatile uint32_t*)(base + 0x820F5F7C)) = __builtin_bswap32(2196905632u);  // -> 0x82F21EA0
+  *((volatile uint32_t*)(base + 0x820FBA08)) = __builtin_bswap32(2196906136u);  // -> 0x82F22098
+  *((volatile uint32_t*)(base + 0x820F3D30)) = __builtin_bswap32(2196908048u);  // -> 0x82F22810
+  *((volatile uint32_t*)(base + 0x820F3D7C)) = __builtin_bswap32(2196908048u);  // -> 0x82F22810
+  *((volatile uint32_t*)(base + 0x820F5150)) = __builtin_bswap32(2196955320u);  // -> 0x82F2E0B8
+  *((volatile uint32_t*)(base + 0x820F54F4)) = __builtin_bswap32(2196959760u);  // -> 0x82F2F210
+  *((volatile uint32_t*)(base + 0x820F5508)) = __builtin_bswap32(2196959760u);  // -> 0x82F2F210
+  *((volatile uint32_t*)(base + 0x820F553C)) = __builtin_bswap32(2196959760u);  // -> 0x82F2F210
+  *((volatile uint32_t*)(base + 0x820F54F8)) = __builtin_bswap32(2196959792u);  // -> 0x82F2F230
+  *((volatile uint32_t*)(base + 0x820F550C)) = __builtin_bswap32(2196959792u);  // -> 0x82F2F230
+  *((volatile uint32_t*)(base + 0x820F5540)) = __builtin_bswap32(2196959792u);  // -> 0x82F2F230
+  *((volatile uint32_t*)(base + 0x820F5EC0)) = __builtin_bswap32(2196982192u);  // -> 0x82F349B0
+  *((volatile uint32_t*)(base + 0x820F5E98)) = __builtin_bswap32(2196982224u);  // -> 0x82F349D0
+  *((volatile uint32_t*)(base + 0x820F5FAC)) = __builtin_bswap32(2196982992u);  // -> 0x82F34CD0
+  *((volatile uint32_t*)(base + 0x820F5F80)) = __builtin_bswap32(2196983024u);  // -> 0x82F34CF0
+  *((volatile uint32_t*)(base + 0x820F8B58)) = __builtin_bswap32(2196984032u);  // -> 0x82F350E0
+  *((volatile uint32_t*)(base + 0x820F8C28)) = __builtin_bswap32(2196984816u);  // -> 0x82F353F0
+  *((volatile uint32_t*)(base + 0x820F8C38)) = __builtin_bswap32(2196984968u);  // -> 0x82F35488
+  *((volatile uint32_t*)(base + 0x8213D110)) = __builtin_bswap32(2196984968u);  // -> 0x82F35488
+  *((volatile uint32_t*)(base + 0x8213D238)) = __builtin_bswap32(2196984968u);  // -> 0x82F35488
+  *((volatile uint32_t*)(base + 0x820F8C4C)) = __builtin_bswap32(2196985120u);  // -> 0x82F35520
+  *((volatile uint32_t*)(base + 0x820FBA58)) = __builtin_bswap32(2197220104u);  // -> 0x82F6EB08
+  *((volatile uint32_t*)(base + 0x820FBA30)) = __builtin_bswap32(2197220136u);  // -> 0x82F6EB28
+  *((volatile uint32_t*)(base + 0x82101A60)) = __builtin_bswap32(2197356144u);  // -> 0x82F8FE70
+  *((volatile uint32_t*)(base + 0x82102BA4)) = __builtin_bswap32(2197496752u);  // -> 0x82FB23B0
+  *((volatile uint32_t*)(base + 0x82116D90)) = __builtin_bswap32(2197733376u);  // -> 0x82FEC000
+  *((volatile uint32_t*)(base + 0x83A639DC)) = __builtin_bswap32(2197888600u);  // -> 0x83011E58
+  *((volatile uint32_t*)(base + 0x823B0460)) = __builtin_bswap32(2198329908u);  // -> 0x8307DA34
+  *((volatile uint32_t*)(base + 0x823B0490)) = __builtin_bswap32(2198331024u);  // -> 0x8307DE90
+  *((volatile uint32_t*)(base + 0x823B05C8)) = __builtin_bswap32(2198368312u);  // -> 0x83087038
+  *((volatile uint32_t*)(base + 0x823B0690)) = __builtin_bswap32(2198376532u);  // -> 0x83089054
+  *((volatile uint32_t*)(base + 0x823B06B0)) = __builtin_bswap32(2198388176u);  // -> 0x8308BDD0
+  *((volatile uint32_t*)(base + 0x8213CFF0)) = __builtin_bswap32(2198397864u);  // -> 0x8308E3A8
+  *((volatile uint32_t*)(base + 0x8213D0A4)) = __builtin_bswap32(2198407136u);  // -> 0x830907E0
+  *((volatile uint32_t*)(base + 0x8213D1CC)) = __builtin_bswap32(2198407136u);  // -> 0x830907E0
+  *((volatile uint32_t*)(base + 0x8213D374)) = __builtin_bswap32(2198407136u);  // -> 0x830907E0
+  *((volatile uint32_t*)(base + 0x8213D0C4)) = __builtin_bswap32(2198407144u);  // -> 0x830907E8
+  *((volatile uint32_t*)(base + 0x8213D1EC)) = __builtin_bswap32(2198407144u);  // -> 0x830907E8
+  *((volatile uint32_t*)(base + 0x8213D394)) = __builtin_bswap32(2198407144u);  // -> 0x830907E8
+  *((volatile uint32_t*)(base + 0x8213D0B0)) = __builtin_bswap32(2198407152u);  // -> 0x830907F0
+  *((volatile uint32_t*)(base + 0x8213D1D8)) = __builtin_bswap32(2198407152u);  // -> 0x830907F0
+  *((volatile uint32_t*)(base + 0x8213D380)) = __builtin_bswap32(2198407152u);  // -> 0x830907F0
+  *((volatile uint32_t*)(base + 0x8213D0EC)) = __builtin_bswap32(2198407160u);  // -> 0x830907F8
+  *((volatile uint32_t*)(base + 0x8213D0CC)) = __builtin_bswap32(2198407176u);  // -> 0x83090808
+  *((volatile uint32_t*)(base + 0x8213D1F4)) = __builtin_bswap32(2198407176u);  // -> 0x83090808
+  *((volatile uint32_t*)(base + 0x8213D39C)) = __builtin_bswap32(2198407176u);  // -> 0x83090808
+  *((volatile uint32_t*)(base + 0x8213D0E8)) = __builtin_bswap32(2198407184u);  // -> 0x83090810
+  *((volatile uint32_t*)(base + 0x8213D210)) = __builtin_bswap32(2198407184u);  // -> 0x83090810
+  *((volatile uint32_t*)(base + 0x8213D3B8)) = __builtin_bswap32(2198407184u);  // -> 0x83090810
+  *((volatile uint32_t*)(base + 0x8213D0BC)) = __builtin_bswap32(2198407192u);  // -> 0x83090818
+  *((volatile uint32_t*)(base + 0x8213D1E4)) = __builtin_bswap32(2198407192u);  // -> 0x83090818
+  *((volatile uint32_t*)(base + 0x8213D38C)) = __builtin_bswap32(2198407192u);  // -> 0x83090818
+  *((volatile uint32_t*)(base + 0x8213D10C)) = __builtin_bswap32(2198407200u);  // -> 0x83090820
+  *((volatile uint32_t*)(base + 0x8213D234)) = __builtin_bswap32(2198407200u);  // -> 0x83090820
+  *((volatile uint32_t*)(base + 0x8213D3DC)) = __builtin_bswap32(2198407200u);  // -> 0x83090820
+  *((volatile uint32_t*)(base + 0x8213D0A0)) = __builtin_bswap32(2198407288u);  // -> 0x83090878
+  *((volatile uint32_t*)(base + 0x8213D1C8)) = __builtin_bswap32(2198407288u);  // -> 0x83090878
+  *((volatile uint32_t*)(base + 0x8213D370)) = __builtin_bswap32(2198407288u);  // -> 0x83090878
+  *((volatile uint32_t*)(base + 0x8213D45C)) = __builtin_bswap32(2198428200u);  // -> 0x83095A28
+  *((volatile uint32_t*)(base + 0x8213D0A8)) = __builtin_bswap32(2198428216u);  // -> 0x83095A38
+  *((volatile uint32_t*)(base + 0x8213D1D0)) = __builtin_bswap32(2198428216u);  // -> 0x83095A38
+  *((volatile uint32_t*)(base + 0x8213D378)) = __builtin_bswap32(2198428216u);  // -> 0x83095A38
+  *((volatile uint32_t*)(base + 0x8213D0C0)) = __builtin_bswap32(2198428224u);  // -> 0x83095A40
+  *((volatile uint32_t*)(base + 0x8213D1E8)) = __builtin_bswap32(2198428224u);  // -> 0x83095A40
+  *((volatile uint32_t*)(base + 0x8213D390)) = __builtin_bswap32(2198428224u);  // -> 0x83095A40
+  *((volatile uint32_t*)(base + 0x8213D47C)) = __builtin_bswap32(2198428232u);  // -> 0x83095A48
+  *((volatile uint32_t*)(base + 0x8213D4D4)) = __builtin_bswap32(2198433232u);  // -> 0x83096DD0
+  *((volatile uint32_t*)(base + 0x8213D440)) = __builtin_bswap32(2198433248u);  // -> 0x83096DE0
+  *((volatile uint32_t*)(base + 0x8213D4B8)) = __builtin_bswap32(2198433248u);  // -> 0x83096DE0
+  *((volatile uint32_t*)(base + 0x8213D410)) = __builtin_bswap32(2198433256u);  // -> 0x83096DE8
+  *((volatile uint32_t*)(base + 0x8213D488)) = __builtin_bswap32(2198433256u);  // -> 0x83096DE8
+  *((volatile uint32_t*)(base + 0x8213D0B8)) = __builtin_bswap32(2198433264u);  // -> 0x83096DF0
+  *((volatile uint32_t*)(base + 0x8213D1E0)) = __builtin_bswap32(2198433264u);  // -> 0x83096DF0
+  *((volatile uint32_t*)(base + 0x8213D388)) = __builtin_bswap32(2198433264u);  // -> 0x83096DF0
+  *((volatile uint32_t*)(base + 0x8213D0E0)) = __builtin_bswap32(2198433272u);  // -> 0x83096DF8
+  *((volatile uint32_t*)(base + 0x8213D208)) = __builtin_bswap32(2198433272u);  // -> 0x83096DF8
+  *((volatile uint32_t*)(base + 0x8213D3B0)) = __builtin_bswap32(2198433272u);  // -> 0x83096DF8
+  *((volatile uint32_t*)(base + 0x8213D0B4)) = __builtin_bswap32(2198433280u);  // -> 0x83096E00
+  *((volatile uint32_t*)(base + 0x8213D1DC)) = __builtin_bswap32(2198433280u);  // -> 0x83096E00
+  *((volatile uint32_t*)(base + 0x8213D384)) = __builtin_bswap32(2198433280u);  // -> 0x83096E00
+  *((volatile uint32_t*)(base + 0x8213D4F4)) = __builtin_bswap32(2198433288u);  // -> 0x83096E08
+  *((volatile uint32_t*)(base + 0x8213D5FC)) = __builtin_bswap32(2198435272u);  // -> 0x830975C8
+  *((volatile uint32_t*)(base + 0x8213D594)) = __builtin_bswap32(2198438648u);  // -> 0x830982F8
+  *((volatile uint32_t*)(base + 0x8213D658)) = __builtin_bswap32(2198442032u);  // -> 0x83099030
+  *((volatile uint32_t*)(base + 0x8213D834)) = __builtin_bswap32(2198454016u);  // -> 0x8309BF00
+  *((volatile uint32_t*)(base + 0x8213D7F4)) = __builtin_bswap32(2198454712u);  // -> 0x8309C1B8
+  *((volatile uint32_t*)(base + 0x823B06C0)) = __builtin_bswap32(2198494040u);  // -> 0x830A5B58
+  *((volatile uint32_t*)(base + 0x823B06C8)) = __builtin_bswap32(2198494040u);  // -> 0x830A5B58
+  *((volatile uint32_t*)(base + 0x823B06E0)) = __builtin_bswap32(2198504808u);  // -> 0x830A8568
+  *((volatile uint32_t*)(base + 0x821416FC)) = __builtin_bswap32(2198511120u);  // -> 0x830A9E10
+  *((volatile uint32_t*)(base + 0x8214170C)) = __builtin_bswap32(2198511128u);  // -> 0x830A9E18
+  *((volatile uint32_t*)(base + 0x821416B0)) = __builtin_bswap32(2198517504u);  // -> 0x830AB700
+  *((volatile uint32_t*)(base + 0x821417C8)) = __builtin_bswap32(2198517504u);  // -> 0x830AB700
+  *((volatile uint32_t*)(base + 0x8215EE00)) = __builtin_bswap32(2198841848u);  // -> 0x830FA9F8
+  *((volatile uint32_t*)(base + 0x8215EE08)) = __builtin_bswap32(2198842304u);  // -> 0x830FABC0
+  *((volatile uint32_t*)(base + 0x8215EE40)) = __builtin_bswap32(2198842304u);  // -> 0x830FABC0
+  *((volatile uint32_t*)(base + 0x82161C68)) = __builtin_bswap32(2198899184u);  // -> 0x831089F0
+  *((volatile uint32_t*)(base + 0x82161C88)) = __builtin_bswap32(2198903872u);  // -> 0x83109C40
+  *((volatile uint32_t*)(base + 0x8217E06C)) = __builtin_bswap32(2200014000u);  // -> 0x83218CB0
+  *((volatile uint32_t*)(base + 0x8217D514)) = __builtin_bswap32(2200016440u);  // -> 0x83219638
+  *((volatile uint32_t*)(base + 0x8217F500)) = __builtin_bswap32(2200210624u);  // -> 0x83248CC0
+  *((volatile uint32_t*)(base + 0x8217F514)) = __builtin_bswap32(2200210648u);  // -> 0x83248CD8
+  *((volatile uint32_t*)(base + 0x8217F474)) = __builtin_bswap32(2200218224u);  // -> 0x8324AA70
+  *((volatile uint32_t*)(base + 0x8217F67C)) = __builtin_bswap32(2200224528u);  // -> 0x8324C310
+  *((volatile uint32_t*)(base + 0x8217F848)) = __builtin_bswap32(2200225664u);  // -> 0x8324C780
+  *((volatile uint32_t*)(base + 0x82180538)) = __builtin_bswap32(2200225664u);  // -> 0x8324C780
+  *((volatile uint32_t*)(base + 0x8217F96C)) = __builtin_bswap32(2200316048u);  // -> 0x83262890
+  *((volatile uint32_t*)(base + 0x82191CC0)) = __builtin_bswap32(2200410008u);  // -> 0x83279798
+  *((volatile uint32_t*)(base + 0x82192F2C)) = __builtin_bswap32(2200429040u);  // -> 0x8327E1F0
+  *((volatile uint32_t*)(base + 0x82193700)) = __builtin_bswap32(2200464688u);  // -> 0x83286D30
+  *((volatile uint32_t*)(base + 0x8218C69C)) = __builtin_bswap32(2200633064u);  // -> 0x832AFEE8
+  *((volatile uint32_t*)(base + 0x820142D4)) = __builtin_bswap32(2201451416u);  // -> 0x83377B98
+  *((volatile uint32_t*)(base + 0x820142DC)) = __builtin_bswap32(2201451432u);  // -> 0x83377BA8
+  *((volatile uint32_t*)(base + 0x82014490)) = __builtin_bswap32(2202061672u);  // -> 0x8340CB68
+  *((volatile uint32_t*)(base + 0x8223394C)) = __builtin_bswap32(2202230112u);  // -> 0x83435D60
+  *((volatile uint32_t*)(base + 0x8222F2C4)) = __builtin_bswap32(2202242424u);  // -> 0x83438D78
+  *((volatile uint32_t*)(base + 0x8222F2E4)) = __builtin_bswap32(2202243232u);  // -> 0x834390A0
+  *((volatile uint32_t*)(base + 0x8222F2E8)) = __builtin_bswap32(2202243256u);  // -> 0x834390B8
+  *((volatile uint32_t*)(base + 0x8222F2EC)) = __builtin_bswap32(2202243280u);  // -> 0x834390D0
+  *((volatile uint32_t*)(base + 0x8227A79C)) = __builtin_bswap32(2203137728u);  // -> 0x835136C0
+  *((volatile uint32_t*)(base + 0x8227A7A8)) = __builtin_bswap32(2203137752u);  // -> 0x835136D8
+  *((volatile uint32_t*)(base + 0x822903A8)) = __builtin_bswap32(2203473216u);  // -> 0x83565540
+  *((volatile uint32_t*)(base + 0x822909F4)) = __builtin_bswap32(2203473216u);  // -> 0x83565540
+  *((volatile uint32_t*)(base + 0x82290AB4)) = __builtin_bswap32(2203473216u);  // -> 0x83565540
+  *((volatile uint32_t*)(base + 0x822CD924)) = __builtin_bswap32(2204259104u);  // -> 0x83625320
+  *((volatile uint32_t*)(base + 0x822DF2DC)) = __builtin_bswap32(2204907176u);  // -> 0x836C36A8
+  *((volatile uint32_t*)(base + 0x822EE808)) = __builtin_bswap32(2205147576u);  // -> 0x836FE1B8
+  *((volatile uint32_t*)(base + 0x822EE818)) = __builtin_bswap32(2205147584u);  // -> 0x836FE1C0
+  *((volatile uint32_t*)(base + 0x822EE804)) = __builtin_bswap32(2205147592u);  // -> 0x836FE1C8
+  *((volatile uint32_t*)(base + 0x822EE854)) = __builtin_bswap32(2205148280u);  // -> 0x836FE478
+  *((volatile uint32_t*)(base + 0x822EE83C)) = __builtin_bswap32(2205148288u);  // -> 0x836FE480
+  *((volatile uint32_t*)(base + 0x822EE850)) = __builtin_bswap32(2205148296u);  // -> 0x836FE488
+  *((volatile uint32_t*)(base + 0x822EEB00)) = __builtin_bswap32(2205155688u);  // -> 0x83700168
+  *((volatile uint32_t*)(base + 0x822EEBD0)) = __builtin_bswap32(2205156928u);  // -> 0x83700640
+  *((volatile uint32_t*)(base + 0x823B0758)) = __builtin_bswap32(2205364064u);  // -> 0x83732F60
+  *((volatile uint32_t*)(base + 0x823B0760)) = __builtin_bswap32(2205364096u);  // -> 0x83732F80
+  *((volatile uint32_t*)(base + 0x823B0780)) = __builtin_bswap32(2205364440u);  // -> 0x837330D8
+  *((volatile uint32_t*)(base + 0x823B0798)) = __builtin_bswap32(2205365316u);  // -> 0x83733444
+  *((volatile uint32_t*)(base + 0x823B07B0)) = __builtin_bswap32(2205365636u);  // -> 0x83733584
+  *((volatile uint32_t*)(base + 0x823B07C8)) = __builtin_bswap32(2205367396u);  // -> 0x83733C64
 }
