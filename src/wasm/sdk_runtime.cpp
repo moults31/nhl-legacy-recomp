@@ -383,6 +383,42 @@ extern "C" int wasm_boot_guest() {
                  (unsigned long long)tctx.r3.u64);
   }
 
+  // Continue boot chain: call more functions that might trigger additional kernel calls
+  static const uint32_t boot_chain[] = {
+    0x83067690,  // KeDelayExecutionThread caller
+    0x8306B6A0,  // ExCreateThread caller
+    0x8306EFE0,  // Another ExCreateThread caller
+    0x8306AEE8,  // RtlInitAnsiString/NtOpenFile
+    0x8306AFF8,  // RtlTimeFieldsToTime
+    0x83067760,  // NtOpenFile caller
+    0x830691B8,  // NtOpenFile caller
+    0x8306A078,  // NtOpenFile caller
+    0x830ABBF8,  // XAudio function
+    0x830ABD00,  // XAudio function
+    0x830AC028,  // XAudio function
+    0, };
+  for (auto* p = boot_chain; *p; ++p) {
+    auto* f = disp->Get(*p);
+    if (!f) continue;
+    PPCContext pctx{};
+    std::memset(&pctx, 0, sizeof(pctx));
+    pctx.r3.u64 = kMod;
+    pctx.r1.u64 = 0x40000000ull;
+    pctx.r13.u64 = 0x10000000ull;
+    pctx.fpscr.InitHost();
+    std::fprintf(stderr, "[sdk] calling 0x%08X...\n", *p);
+    auto start = std::chrono::steady_clock::now();
+    f(pctx, base);
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    std::fprintf(stderr, "[sdk] 0x%08X → r3=0x%llX (%lld ms)\n",
+                 *p, (unsigned long long)pctx.r3.u64, (long long)elapsed);
+    if (elapsed > 5000) {
+      std::fprintf(stderr, "[sdk] TIMEOUT — skipping rest\n");
+      break;
+    }
+  }
+
   return 0;
 }
 // Auto-generated: 354 data section initializers from nhllegacy_functions.toml
