@@ -26,6 +26,9 @@ cp -v "${PATCH_DIR}/rex/platform/fpscr.h"     "${SDK_DIR}/include/rex/platform/f
 cp -v "${PATCH_DIR}/rex/chrono/chrono.h"      "${SDK_DIR}/include/rex/chrono/chrono.h"
 cp -v "${PATCH_DIR}/rex/ppc/intrinsics.h"     "${SDK_DIR}/include/rex/ppc/intrinsics.h"
 
+# Patch SDK source files for WASM
+cp -v "${PATCH_DIR}/rex/core/fiber_posix.cpp" "${SDK_DIR}/src/core/fiber_posix.cpp"
+
 # Include paths
 SDK_INC="${SDK_DIR}/include"
 TP="${SDK_DIR}/thirdparty"
