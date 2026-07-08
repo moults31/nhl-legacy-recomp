@@ -428,8 +428,11 @@ extern "C" int wasm_boot_guest() {
     0x83069640,  // MmAllocatePhysicalMemoryEx caller
     // 0x83095C48,  // XMA context creation loop — SKIP to avoid infinite loop
     0x836EF540,  // TU 160 function
-    0x836EF5A8,  // TU 160 function
+    // 0x836EF5A8,  // TU 160 function — SKIP (OOB crash)
     0x836EF650,  // TU 160 function
+    0x8370AD68,  // TU 160 function
+    0x8370B1C0,  // TU 160 function
+    0x8370B458,  // TU 160 function
     0, };
   for (auto* p = boot_chain; *p; ++p) {
     auto* f = disp->Get(*p);
