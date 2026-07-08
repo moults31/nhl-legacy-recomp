@@ -247,8 +247,35 @@ void EnableAffinityConfiguration() {}
 // ---- MMIO Handler ----------------------------------------------------------
 
 namespace rex::runtime {
-MMIOHandler* MMIOHandler::global_handler() { return nullptr; }
+// MMIO handler stub — provides dummy implementations for memory-mapped I/O
+MMIOHandler::MMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase, uint8_t* membase_end,
+                         HostToGuestVirtual host_to_guest_virtual, const void* host_to_guest_virtual_context,
+                         AccessViolationCallback access_violation_callback, void* access_violation_callback_context)
+    : virtual_membase_(virtual_membase), physical_membase_(physical_membase), memory_end_(membase_end),
+      host_to_guest_virtual_(host_to_guest_virtual), host_to_guest_virtual_context_(host_to_guest_virtual_context),
+      access_violation_callback_(access_violation_callback), access_violation_callback_context_(access_violation_callback_context) {}
+
+MMIOHandler* MMIOHandler::global_handler() {
+  static MMIOHandler handler(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  return &handler;
+}
+
 MMIOHandler::~MMIOHandler() = default;
+
+bool MMIOHandler::CheckLoad(uint32_t addr, uint32_t* out) {
+  static std::atomic<unsigned> _c{0};
+  auto n = _c.fetch_add(1, std::memory_order_relaxed);
+  if (n < 5) std::fprintf(stderr, "[sdk] MMIO CheckLoad: 0x%08X (#%u)\n", addr, n + 1);
+  *out = 0;
+  return true;
+}
+
+bool MMIOHandler::CheckStore(uint32_t addr, uint32_t val) {
+  static std::atomic<unsigned> _c{0};
+  auto n = _c.fetch_add(1, std::memory_order_relaxed);
+  if (n < 5) std::fprintf(stderr, "[sdk] MMIO CheckStore: 0x%08X = 0x%08X (#%u)\n", addr, val, n + 1);
+  return true;
+}
 }  // namespace rex::runtime
 
 // ---- SEH — not available on WASM -------------------------------------------
@@ -399,6 +426,7 @@ extern "C" int wasm_boot_guest() {
     0x827FE0F8,  // MmAllocatePhysicalMemoryEx caller
     0x836FB1E8,  // RtlImageXexHeaderField caller
     0x83069640,  // MmAllocatePhysicalMemoryEx caller
+    0x83095C48,  // MmMapIoSpace caller
     0, };
   for (auto* p = boot_chain; *p; ++p) {
     auto* f = disp->Get(*p);
