@@ -146,8 +146,8 @@ static void __wasm_trap_handler(PPCContext& ctx, uint8_t* base) {
   (void)base;
   static std::atomic<unsigned> _cnt{0};
   auto n = _cnt.fetch_add(1, std::memory_order_relaxed);
-  if (n < 3) std::fprintf(stderr, "[sdk] TRAP (#%u) → STATUS_UNSUCCESSFUL\n", n + 1);
-  ctx.r3.u64 = 0xC0000001u;
+  if (n < 5) std::fprintf(stderr, "[sdk] TRAP (#%u) → 0 (skip)\n", n + 1);
+  ctx.r3.u64 = 0u;  // return 0 = success/null — skips loops
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
@@ -304,9 +304,11 @@ extern "C" int wasm_boot_guest() {
   // Create a fake module handle at guest address 0x11000000.
   const uint32_t kMod = 0x11000000;
   auto* mod = reinterpret_cast<volatile uint32_t*>(base + kMod);
-  mod[0] = __builtin_bswap32(0x82450000);
-  mod[1] = __builtin_bswap32(kMod + 16);
-  mod[2] = __builtin_bswap32(kMod + 32);
+  mod[0] = __builtin_bswap32(0x82450000u); // vtable → entry
+  mod[1] = __builtin_bswap32(0u);           // count: 0 items (skip loop)
+  mod[2] = __builtin_bswap32(kMod + 16u);   // ptr to sub-struct
+  // Sub-struct at kMod+16: zero-fill 60 bytes for one item
+  for (int i = 4; i < 20; ++i) mod[i] = 0;
 
   PPCFunc* entry = disp->Get(static_cast<uint32_t>(PPCImageConfig.code_base));
   if (!entry) {
@@ -337,7 +339,12 @@ extern "C" int wasm_boot_guest() {
   // Probe the init chain — call more functions with the proper module handle.
   static const uint32_t init_chain[] = {
     0x82451038, 0x82451160, 0x82452620, 0x82452DC8, 0x82453280,
-    0x82456000, 0x82458000, 0x8245A000, 0, };
+    0x82456000, 0x82458000, 0x8245A000, 0x8245D000, 0x82460000,
+    0x82465000, 0x8246A000, 0x82470000, 0x82475000, 0x8247A000,
+    0x82480000, 0x82488000, 0x82490000, 0x83060000, 0x8307A000,
+    0x83100000, 0x83200000, 0x83300000, 0x83400000, 0x83500000,
+    0x83600000, 0x83700000, 0x83800000,
+    0, };
   for (auto* p = init_chain; *p; ++p) {
     auto* f = disp->Get(*p);
     if (!f) continue;
@@ -361,6 +368,21 @@ extern "C" int wasm_boot_guest() {
       break;
     }
   }
+
+  // Test: call a function known to invoke kernel stubs.
+  uint32_t kernel_test = 0x83069B10;
+  auto* ftest = disp->Get(kernel_test);
+  if (ftest) {
+    PPCContext tctx{};
+    std::memset(&tctx, 0, sizeof(tctx));
+    tctx.r1.u64 = 0x40000000ull;
+    tctx.fpscr.InitHost();
+    std::fprintf(stderr, "[sdk] kernel test: 0x%08X...\n", kernel_test);
+    ftest(tctx, base);
+    std::fprintf(stderr, "[sdk] kernel test returned r3=0x%llX\n",
+                 (unsigned long long)tctx.r3.u64);
+  }
+
   return 0;
 }
 // Auto-generated: 354 data section initializers from nhllegacy_functions.toml
