@@ -1,5 +1,5 @@
-# WASM build — compiles all generated recomp TUs into a static library.
-# Usage: source /tmp/emsdk/emsdk_env.sh && emcmake cmake -S web -B out/web/build -G Ninja
+# WASM build — produces nhllegacy.wasm from generated recomp + minimal runtime stubs.
+# Usage: source /tmp/emsdk/emsdk_env.sh && emcmake cmake -S web -B out/wasm/build -G Ninja
 cmake_minimum_required(VERSION 3.25)
 project(nhllegacy-wasm LANGUAGES C CXX)
 
@@ -9,26 +9,56 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(GENERATED_DIR "${CMAKE_SOURCE_DIR}/../generated/default")
 set(SDK_DIR "${CMAKE_SOURCE_DIR}/../out/linux/deps/rexglue-sdk")
 set(PATCH_DIR "${CMAKE_SOURCE_DIR}/patches")
+set(WASM_SRC "${CMAKE_SOURCE_DIR}/../src/wasm")
+set(SRC_DIR "${CMAKE_SOURCE_DIR}/../src")
 
 # Include paths (with patched headers taking precedence)
 set(NHL_WASM_INCLUDES
-  "${PATCH_DIR}"                    # patched headers first
-  "${GENERATED_DIR}"                # generated init.h
-  "${SDK_DIR}/include"              # SDK headers
-  "${SDK_DIR}/thirdparty/simde"     # SIMDE
-  "${SDK_DIR}/thirdparty/fmt/include" # fmt
-  "${SDK_DIR}/thirdparty/spdlog/include" # spdlog
-  "${SDK_DIR}/thirdparty/tomlplusplus/include" # toml++
+  "${PATCH_DIR}"
+  "${GENERATED_DIR}"
+  "${SDK_DIR}/include"
+  "${SDK_DIR}/thirdparty/simde"
+  "${SDK_DIR}/thirdparty/fmt/include"
+  "${SDK_DIR}/thirdparty/spdlog/include"
+  "${SDK_DIR}/thirdparty/tomlplusplus/include"
 )
 
+# ----- generated recomp library -----
 file(GLOB GENERATED_SOURCES "${GENERATED_DIR}/*.cpp")
-
 add_library(nhllegacy_recomp STATIC ${GENERATED_SOURCES})
 target_include_directories(nhllegacy_recomp PRIVATE ${NHL_WASM_INCLUDES})
-target_compile_options(nhllegacy_recomp PRIVATE
-  -pthread
-  -Wno-deprecated-pragma
+target_compile_options(nhllegacy_recomp PRIVATE -pthread -Wno-deprecated-pragma)
+target_link_options(nhllegacy_recomp PRIVATE -pthread)
+
+# ----- executable -----
+set(WASM_SOURCES
+  ${WASM_SRC}/runtime_stubs.cpp
+  ${WASM_SRC}/windowed_app_context_html5.cpp
 )
-target_link_options(nhllegacy_recomp PRIVATE
+
+add_executable(nhllegacy ${WASM_SOURCES})
+target_include_directories(nhllegacy PRIVATE
+  ${NHL_WASM_INCLUDES}
+  ${WASM_SRC}
+  ${SRC_DIR}
+  ${SDK_DIR}/src
+  ${CMAKE_SOURCE_DIR}/..  # repo root (for generated/default/ relative includes)
+)
+target_compile_options(nhllegacy PRIVATE -pthread -Wno-deprecated-pragma)
+target_link_libraries(nhllegacy PRIVATE nhllegacy_recomp)
+
+target_link_options(nhllegacy PRIVATE
   -pthread
+  -O0
+  -g0
+  -sWASM_BIGINT
+  -sALLOW_MEMORY_GROWTH=1
+  -sMAXIMUM_MEMORY=4GB
+  -sINITIAL_MEMORY=256MB
+  -sSTACK_SIZE=4MB
+  -sNO_EXIT_RUNTIME=0
+  -sEXIT_RUNTIME=1
+  -sERROR_ON_UNDEFINED_SYMBOLS=0
+  -Wl,--allow-undefined
+  -sLINKABLE=1
 )

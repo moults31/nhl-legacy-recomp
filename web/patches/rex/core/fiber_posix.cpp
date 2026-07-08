@@ -84,7 +84,11 @@ namespace rex::thread {
 thread_local Fiber* Fiber::tls_current_ = nullptr;
 
 Fiber* Fiber::ConvertCurrentThread() {
-  return static_cast<Fiber*>(this);  // return self as marker
+  // WASM: no-op. Return a valid sentinel pointer so XThread doesn't crash.
+  static Fiber sentinel;
+  sentinel.is_thread_fiber_ = true;
+  tls_current_ = &sentinel;
+  return &sentinel;
 }
 
 Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
