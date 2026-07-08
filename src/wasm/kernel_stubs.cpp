@@ -13,12 +13,22 @@
 extern "C" {
 #endif
 
+// Global call counter to detect infinite loops
+static std::atomic<unsigned> g_total_calls{0};
+static constexpr unsigned kMaxCalls = 10000;
+
 #define STUB_LOG(name) \
   do { \
     static std::atomic<unsigned> _c{0}; \
     auto n = _c.fetch_add(1, std::memory_order_relaxed); \
+    auto total = g_total_calls.fetch_add(1, std::memory_order_relaxed); \
     if (n < 5 || (n % 1000) == 0) \
-      std::fprintf(stderr, "[wasm] %-40s #%u\n", name, n + 1); \
+      std::fprintf(stderr, "[wasm] %-40s #%u (total: %u)\n", name, n + 1, total + 1); \
+    if (total > kMaxCalls) { \
+      std::fprintf(stderr, "[wasm] ABORT: too many kernel calls (%u)\n", total + 1); \
+      std::fflush(stderr); \
+      emscripten_force_exit(1); \
+    } \
   } while(0)
 
 __attribute__((weak, noinline)) void __imp____C_specific_handler(PPCContext& ctx, uint8_t* base) {

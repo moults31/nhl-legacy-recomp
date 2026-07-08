@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -31,6 +32,26 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/perf/counter.h>
+
+// Timeout handler
+// Note: WASM is single-threaded and synchronous. If the guest enters a tight
+// computational loop, we cannot break out from the outside. The only solution
+// is to run the guest in a web worker with a timeout, or fix the kernel stubs
+// to not cause infinite loops. For now, we document this as a known limitation.
+static double g_start_time = 0;
+static bool g_timeout_reached = false;
+
+static void timeout_check() {
+  if (g_start_time > 0) {
+    double elapsed = emscripten_get_now() - g_start_time;
+    if (elapsed > 10000.0) {  // 10 seconds
+      std::fprintf(stderr, "[sdk] TIMEOUT: guest execution exceeded 10 seconds\n");
+      std::fflush(stderr);
+      g_timeout_reached = true;
+      // Cannot force exit from WASM — documented limitation
+    }
+  }
+}
 
 // ============================================================================
 // Guest memory — dynamically allocated to cover full guest address space.
@@ -306,6 +327,9 @@ extern "C" int wasm_boot_guest() {
                (unsigned long long)ctx.r1.u64,
                (unsigned long long)ctx.r13.u64);
 
+  // Note: Cannot set up timeout in WASM — guest may hang in tight loop
+  // This is a known limitation documented in the timeout_check() function
+
   entry(ctx, base);
   std::fprintf(stderr, "[sdk] guest entry returned r3=0x%llX\n",
                (unsigned long long)ctx.r3.u64);
@@ -323,8 +347,19 @@ extern "C" int wasm_boot_guest() {
     pctx.r1.u64 = 0x40000000ull;
     pctx.r13.u64 = 0x10000000ull;
     pctx.fpscr.InitHost();
+    std::fprintf(stderr, "[sdk] calling 0x%08X...\n", *p);
+    std::fflush(stderr);
+    auto start = std::chrono::steady_clock::now();
     f(pctx, base);
-    std::fprintf(stderr, "[sdk] 0x%08X → r3=0x%llX\n", *p, (unsigned long long)pctx.r3.u64);
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    std::fprintf(stderr, "[sdk] 0x%08X → r3=0x%llX (%lld ms)\n",
+                 *p, (unsigned long long)pctx.r3.u64, (long long)elapsed);
+    std::fflush(stderr);
+    if (elapsed > 5000) {
+      std::fprintf(stderr, "[sdk] TIMEOUT — skipping rest\n");
+      break;
+    }
   }
   return 0;
 }
