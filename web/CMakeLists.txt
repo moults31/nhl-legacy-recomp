@@ -1,4 +1,4 @@
-# WASM build — produces nhllegacy.wasm from generated recomp + minimal runtime stubs.
+# WASM build — produces nhllegacy.wasm from generated recomp + SDK runtime.
 # Usage: source /tmp/emsdk/emsdk_env.sh && emcmake cmake -S web -B out/wasm/build -G Ninja
 cmake_minimum_required(VERSION 3.25)
 project(nhllegacy-wasm LANGUAGES C CXX)
@@ -12,7 +12,7 @@ set(PATCH_DIR "${CMAKE_SOURCE_DIR}/patches")
 set(WASM_SRC "${CMAKE_SOURCE_DIR}/../src/wasm")
 set(SRC_DIR "${CMAKE_SOURCE_DIR}/../src")
 
-# Include paths (with patched headers taking precedence)
+# Include paths (patched headers take precedence)
 set(NHL_WASM_INCLUDES
   "${PATCH_DIR}"
   "${GENERATED_DIR}"
@@ -33,6 +33,7 @@ target_link_options(nhllegacy_recomp PRIVATE -pthread)
 # ----- executable -----
 set(WASM_SOURCES
   ${WASM_SRC}/runtime_stubs.cpp
+  ${WASM_SRC}/sdk_runtime.cpp
   ${WASM_SRC}/kernel_stubs.cpp
   ${WASM_SRC}/windowed_app_context_html5.cpp
 )
@@ -54,12 +55,9 @@ target_link_options(nhllegacy PRIVATE
   -g0
   -sWASM_BIGINT
   -sALLOW_MEMORY_GROWTH=1
-  -sMAXIMUM_MEMORY=4GB
-  -sINITIAL_MEMORY=256MB
+  -sMAXIMUM_MEMORY=4294967296
+  -sINITIAL_MEMORY=2684354560
   -sSTACK_SIZE=4MB
-  -sNO_EXIT_RUNTIME=0
-  -sEXIT_RUNTIME=1
   -sERROR_ON_UNDEFINED_SYMBOLS=0
   -Wl,--allow-undefined
-  -sLINKABLE=1
 )
