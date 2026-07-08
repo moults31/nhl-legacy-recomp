@@ -396,6 +396,9 @@ extern "C" int wasm_boot_guest() {
     0x830ABBF8,  // XAudio function
     0x830ABD00,  // XAudio function
     0x830AC028,  // XAudio function
+    0x827FE0F8,  // MmAllocatePhysicalMemoryEx caller
+    0x836FB1E8,  // RtlImageXexHeaderField caller
+    0x83069640,  // MmAllocatePhysicalMemoryEx caller
     0, };
   for (auto* p = boot_chain; *p; ++p) {
     auto* f = disp->Get(*p);
