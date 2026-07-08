@@ -15,7 +15,7 @@ extern "C" {
 
 // Global call counter to detect infinite loops
 static std::atomic<unsigned> g_total_calls{0};
-static constexpr unsigned kMaxCalls = 10000;
+static constexpr unsigned kMaxCalls = 100000;
 
 #define STUB_LOG(name) \
   do { \

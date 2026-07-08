@@ -426,7 +426,10 @@ extern "C" int wasm_boot_guest() {
     0x827FE0F8,  // MmAllocatePhysicalMemoryEx caller
     0x836FB1E8,  // RtlImageXexHeaderField caller
     0x83069640,  // MmAllocatePhysicalMemoryEx caller
-    0x83095C48,  // MmMapIoSpace caller
+    // 0x83095C48,  // XMA context creation loop — SKIP to avoid infinite loop
+    0x836EF540,  // TU 160 function
+    0x836EF5A8,  // TU 160 function
+    0x836EF650,  // TU 160 function
     0, };
   for (auto* p = boot_chain; *p; ++p) {
     auto* f = disp->Get(*p);
