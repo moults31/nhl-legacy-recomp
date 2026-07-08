@@ -1,30 +1,28 @@
-#include "src/wasm/webgpu_graphics_system.h"
+// WebGPU graphics system — skeleton. No-op until emdawnwebgpu API is integrated.
 
-#include <utility>
+#include "webgpu_graphics_system.h"
+#include "webgpu_command_processor.h"
+
+#include <cstdio>
 
 #include <rex/logging.h>
-#include <rex/system/kernel_state.h>
-
-#include "src/wasm/webgpu_command_processor.h"
 
 namespace rex::graphics::webgpu {
 
-WebGpuGraphicsSystem::WebGpuGraphicsSystem() {}
+WebGpuGraphicsSystem::WebGpuGraphicsSystem() = default;
+WebGpuGraphicsSystem::~WebGpuGraphicsSystem() = default;
 
-WebGpuGraphicsSystem::~WebGpuGraphicsSystem() {}
-
-std::string WebGpuGraphicsSystem::name() const {
-  return "WebGPU";
+bool WebGpuGraphicsSystem::IsAvailable() {
+  return true;  // skeleton always available (no-ops)
 }
 
 void WebGpuGraphicsSystem::CreateProvider(bool with_presentation) {
-  // TODO(Phase 4): Create WebGpuProvider with instance/adapter/device.
-  // For now no provider exists — presentation will be unavailable.
   (void)with_presentation;
-  REXGPU_WARN("CreateProvider — stubbed, no WebGPU device created");
+  std::fprintf(stderr, "[webgpu] CreateProvider — skeleton (no GPU init yet)\n");
 }
 
-std::unique_ptr<CommandProcessor> WebGpuGraphicsSystem::CreateCommandProcessor() {
+std::unique_ptr<rex::graphics::CommandProcessor>
+WebGpuGraphicsSystem::CreateCommandProcessor() {
   return std::make_unique<WebGpuCommandProcessor>(this, kernel_state_);
 }
 

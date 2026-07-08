@@ -33,9 +33,11 @@ target_link_options(nhllegacy_recomp PRIVATE -pthread)
 # ----- executable -----
 set(WASM_SOURCES
   ${WASM_SRC}/runtime_stubs.cpp
-  ${WASM_SRC}/sdk_runtime.cpp
   ${WASM_SRC}/kernel_stubs.cpp
+  ${WASM_SRC}/sdk_runtime.cpp
   ${WASM_SRC}/windowed_app_context_html5.cpp
+  ${WASM_SRC}/webgpu_graphics_system.cpp
+  ${WASM_SRC}/webgpu_command_processor.cpp
 )
 
 add_executable(nhllegacy ${WASM_SOURCES})
@@ -60,4 +62,5 @@ target_link_options(nhllegacy PRIVATE
   -sSTACK_SIZE=4MB
   -sERROR_ON_UNDEFINED_SYMBOLS=0
   -Wl,--allow-undefined
+  -sLINKABLE=1
 )

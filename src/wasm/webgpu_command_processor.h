@@ -1,3 +1,5 @@
+// WebGPU command processor — skeleton. No-op pending emdawnwebgpu integration.
+
 #pragma once
 
 #include <cstdint>
