@@ -30,8 +30,7 @@ set(NHL_WASM_INCLUDES
 file(GLOB GENERATED_SOURCES "${GENERATED_DIR}/*.cpp")
 add_library(nhllegacy_recomp STATIC ${GENERATED_SOURCES})
 target_include_directories(nhllegacy_recomp PRIVATE ${NHL_WASM_INCLUDES})
-target_compile_options(nhllegacy_recomp PRIVATE -pthread -Wno-deprecated-pragma)
-target_link_options(nhllegacy_recomp PRIVATE -pthread)
+target_compile_options(nhllegacy_recomp PRIVATE -Wno-deprecated-pragma)
 
 # ----- executable -----
 set(WASM_SOURCES
@@ -51,11 +50,10 @@ target_include_directories(nhllegacy PRIVATE
   ${SDK_DIR}/src
   ${CMAKE_SOURCE_DIR}/..  # repo root (for generated/default/ relative includes)
 )
-target_compile_options(nhllegacy PRIVATE -pthread -Wno-deprecated-pragma)
+target_compile_options(nhllegacy PRIVATE -Wno-deprecated-pragma)
 target_link_libraries(nhllegacy PRIVATE nhllegacy_recomp)
 
 target_link_options(nhllegacy PRIVATE
-  -pthread
   -O0
   -g0
   -sWASM_BIGINT
@@ -65,5 +63,5 @@ target_link_options(nhllegacy PRIVATE
   -sSTACK_SIZE=4MB
   -sERROR_ON_UNDEFINED_SYMBOLS=0
   -Wl,--allow-undefined
-  -sLINKABLE=1
+  --profiling-funcs
 )
