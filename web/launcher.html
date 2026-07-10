@@ -87,7 +87,11 @@
               log('[wasm] main() returned', 'info');
               statusEl.textContent = 'WASM instantiated — main() finished';
               // GPU init on macrotask (event loop available, not inside microtask)
-              setTimeout(function() { initWebGpu(Module.canvas); }, 0);
+              setTimeout(function() {
+                initWebGpu(Module.canvas).catch(function(e) {
+                  log('[gpu] ERROR: ' + (e.message || String(e)), 'err');
+                });
+              }, 0);
             })
             .catch(function(err) {
               var msg = err.message || String(err);
@@ -116,7 +120,9 @@
     // WebGPU init — runs after WASM runtime is ready (called via setTimeout)
     async function initWebGpu(canvas) {
       if (!navigator.gpu) {
-        log('[gpu] WebGPU not available', 'warn');
+        log('[gpu] navigator.gpu not available — WebGPU disabled', 'warn');
+        log('[gpu] Enable in chrome://flags/#enable-unsafe-webgpu', 'warn');
+        log('[gpu] Then check chrome://gpu for WebGPU status', 'warn');
         return null;
       }
       log('[gpu] Requesting adapter...', 'info');
@@ -156,9 +162,6 @@
       device.queue.submit([encoder.finish()]);
       log('[gpu] First frame rendered ✓', 'info');
     }
-
-    // Schedule WebGPU init as a postRun callback (fires after main() returns)
-    Module.postRun.push(() => { initWebGpu(Module.canvas); });
   </script>
   <script src="nhllegacy.js"></script>
 </body>
