@@ -685,6 +685,7 @@ Entry::Entry(Device* device, Entry* parent, const std::string_view path)
     name_ = std::string(path);
 }
 Entry::~Entry() = default;
+Entry* Entry::ResolvePath(const std::string_view path) { return nullptr; }
 
 VirtualFileSystem::VirtualFileSystem() = default;
 VirtualFileSystem::~VirtualFileSystem() = default;
@@ -712,10 +713,13 @@ HostPathDevice::~HostPathDevice() = default;
 // Embedded test manifest for when the server-side manifest isn't available
 static const char kTestManifest[] = R"({
   "files": {
-    "fe\\ion\\mainmenu.bin": {"o": 0, "s": 16384, "us": 16384, "c": "none"},
-    "rendering\\player\\texlib_0.rx2": {"o": 16384, "s": 2048, "us": 2048, "c": "none"},
-    "audio\\boot\\audio_boot.bnk": {"o": 18432, "s": 4096, "us": 4096, "c": "none"},
-    "data\\boot\\boot.big": {"o": 22528, "s": 4096, "us": 4096, "c": "none"}
+    "boot.big": {"o": 0, "s": 11184432, "us": 11184432, "c": "none"},
+    "renderboot.big": {"o": 11184432, "s": 9401248, "us": 9401248, "c": "none"},
+    "audioboot.big": {"o": 20585680, "s": 1381808, "us": 1381808, "c": "none"},
+    "audioboot2.big": {"o": 21967488, "s": 5635728, "us": 5635728, "c": "none"},
+    "data0.big": {"o": 27603216, "s": 29427680, "us": 29427680, "c": "none"},
+    "cacheboot.big": {"o": 57030896, "s": 31705408, "us": 31705408, "c": "none"},
+    "default.xex": {"o": 88736304, "s": 10448896, "us": 10448896, "c": "none"}
   }
 })";
 
@@ -771,7 +775,8 @@ static uint32_t s_next_handle = 1;
 uint32_t WasmOpenFile(const char* guest_path, uint32_t& out_status) {
 #ifdef __EMSCRIPTEN__
   if (!g_wasm_vfs_device) {
-    out_status = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+    out_status = 0xC0000034u;
+    std::fprintf(stderr, "no device\n");
     return 0;
   }
 
@@ -779,6 +784,7 @@ uint32_t WasmOpenFile(const char* guest_path, uint32_t& out_status) {
   auto* entry = g_wasm_vfs_device->ResolvePath(guest_path);
   if (!entry) {
     out_status = 0xC0000034u;
+    std::fprintf(stderr, "not found\n");
     return 0;
   }
 

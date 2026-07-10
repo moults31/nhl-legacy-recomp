@@ -7,6 +7,7 @@
 #include <atomic>
 
 #include <rex/ppc.h>
+#include <rex/system/xio.h>
 #include <emscripten.h>
 #include "vfs_bridge.h"
 
@@ -643,48 +644,46 @@ __attribute__((weak, noinline)) void __imp__NtCreateEvent(PPCContext& ctx, uint8
 }
 __attribute__((weak, noinline)) void __imp__NtCreateFile(PPCContext& ctx, uint8_t* base) {
   STUB_LOG("__imp__NtCreateFile");
-  // r3 = PHANDLE (output handle ptr in guest mem), r5 = OBJECT_ATTRIBUTES ptr
+  // r3 = PHANDLE, r5 = X_OBJECT_ATTRIBUTES (ANSI name works on X360)
+  // X_OBJECT_ATTRIBUTES: +0 root_dir, +4 name_ptr(ANSI_STRING*)
+  // ANSI_STRING: +0 length(be16), +2 max_len(be16), +4 pointer(be32)
+  // length of 0xFFFF means null-terminated (length unknown)
   uint32_t handle_ptr = ctx.r3.u32;
   uint32_t obj_attr = ctx.r5.u32;
-
   if (obj_attr >= 0x1000) {
-    // Read ObjectName (PUNICODE_STRING) from ObjectAttributes+8
-    uint32_t unicode_ptr = __builtin_bswap32(*(volatile uint32_t*)(base + obj_attr + 8));
-    if (unicode_ptr >= 0x1000) {
-      // Read Buffer pointer from UNICODE_STRING+4
-      uint32_t buf_ptr = __builtin_bswap32(*(volatile uint32_t*)(base + unicode_ptr + 4));
-      // Read Length (byte count, not including null) from UNICODE_STRING+0
-      uint16_t str_len = __builtin_bswap16(*(volatile uint16_t*)(base + unicode_ptr));
-
-      if (buf_ptr >= 0x1000 && str_len > 0 && str_len < 1024) {
-        // Convert wide string to narrow (ASCII approximation for paths)
-        char path[1024];
+    uint32_t ansi_ptr = __builtin_bswap32(*(volatile uint32_t*)(base + obj_attr + 4));
+    if (ansi_ptr >= 0x1000) {
+      uint32_t buf = __builtin_bswap32(*(volatile uint32_t*)(base + ansi_ptr + 4));
+      uint16_t len = __builtin_bswap16(*(volatile uint16_t*)(base + ansi_ptr));
+      if (buf >= 0x1000) { std::fprintf(stderr, "[vfs] path len=%u\n", len);
+        // Dump first 20 bytes of buffer to see if it's ANSI or UTF-16
+        for (int di = 0; di < 20; ++di)
+          std::fprintf(stderr, "%02X", *(volatile uint8_t*)(base + buf + di));
+        std::fprintf(stderr, "\n");
+        char path[260];
         int plen = 0;
-        for (uint16_t i = 0; i + 1 < str_len && i < sizeof(path) - 1; i += 2) {
-          uint16_t wc = __builtin_bswap16(*(volatile uint16_t*)(base + buf_ptr + i));
-          if (wc < 128) path[plen++] = (char)wc;
+        // Read up to 259 chars or until null terminator
+        for (int i = 0; i < 259 && i < (int)(len == 0xFFFF ? 259 : len); ++i) {
+          char c = (char)(*(volatile uint8_t*)(base + buf + i));
+          if (c == '\0') break;
+          if (c >= 0x20) path[plen++] = c;
         }
         path[plen] = '\0';
-
-        // Strip device prefix if present
-        const char* file_path = path;
-        const char* dev_prefix = "\\Device\\Harddisk0\\Partition1";
-        if (strncmp(path, dev_prefix, strlen(dev_prefix)) == 0) {
-          file_path = path + strlen(dev_prefix);
-          while (*file_path == '\\') ++file_path;
+        const char* fp = path;
+        const char* dp = "\\Device\\Harddisk0\\Partition1";
+        if (strncmp(path, dp, strlen(dp)) == 0) {
+          fp = path + strlen(dp);
+          while (*fp == '\\') ++fp;
         }
-
-        uint32_t status;
-        uint32_t handle = WasmOpenFile(file_path, status);
-        if (handle && handle_ptr >= 0x1000) {
-          *(volatile uint32_t*)(base + handle_ptr) = __builtin_bswap32(handle);
-        }
-        ctx.r3.u64 = status;
+        uint32_t st;
+        uint32_t h = WasmOpenFile(fp, st);
+        if (h && handle_ptr >= 0x1000)
+          *(volatile uint32_t*)(base + handle_ptr) = __builtin_bswap32(h);
+        ctx.r3.u64 = st;
         return;
       }
     }
   }
-
   ctx.r3.u64 = 0u;
 }
 __attribute__((weak, noinline)) void __imp__NtCreateMutant(PPCContext& ctx, uint8_t* base) {
@@ -724,43 +723,41 @@ __attribute__((weak, noinline)) void __imp__NtFreeVirtualMemory(PPCContext& ctx,
 }
 __attribute__((weak, noinline)) void __imp__NtOpenFile(PPCContext& ctx, uint8_t* base) {
   STUB_LOG("__imp__NtOpenFile");
-  // r3 = PHANDLE (output), r5 = OBJECT_ATTRIBUTES ptr
   uint32_t handle_ptr = ctx.r3.u32;
   uint32_t obj_attr = ctx.r5.u32;
-
   if (obj_attr >= 0x1000) {
-    uint32_t unicode_ptr = __builtin_bswap32(*(volatile uint32_t*)(base + obj_attr + 8));
-    if (unicode_ptr >= 0x1000) {
-      uint32_t buf_ptr = __builtin_bswap32(*(volatile uint32_t*)(base + unicode_ptr + 4));
-      uint16_t str_len = __builtin_bswap16(*(volatile uint16_t*)(base + unicode_ptr));
-
-      if (buf_ptr >= 0x1000 && str_len > 0 && str_len < 1024) {
-        char path[1024];
+    uint32_t ansi_ptr = __builtin_bswap32(*(volatile uint32_t*)(base + obj_attr + 4));
+    if (ansi_ptr >= 0x1000) {
+      uint32_t buf = __builtin_bswap32(*(volatile uint32_t*)(base + ansi_ptr + 4));
+      uint16_t len = __builtin_bswap16(*(volatile uint16_t*)(base + ansi_ptr));
+      if (buf >= 0x1000) { std::fprintf(stderr, "[vfs] path len=%u\n", len);
+        // Dump first 20 bytes of buffer to see if it's ANSI or UTF-16
+        for (int di = 0; di < 20; ++di)
+          std::fprintf(stderr, "%02X", *(volatile uint8_t*)(base + buf + di));
+        std::fprintf(stderr, "\n");
+        char path[260];
         int plen = 0;
-        for (uint16_t i = 0; i + 1 < str_len && i < sizeof(path) - 1; i += 2) {
-          uint16_t wc = __builtin_bswap16(*(volatile uint16_t*)(base + buf_ptr + i));
-          if (wc < 128) path[plen++] = (char)wc;
+        for (int i = 0; i < 259 && i < (int)(len == 0xFFFF ? 259 : len); ++i) {
+          char c = (char)(*(volatile uint8_t*)(base + buf + i));
+          if (c == '\0') break;
+          if (c >= 0x20) path[plen++] = c;
         }
         path[plen] = '\0';
-
-        const char* file_path = path;
-        const char* dev_prefix = "\\Device\\Harddisk0\\Partition1";
-        if (strncmp(path, dev_prefix, strlen(dev_prefix)) == 0) {
-          file_path = path + strlen(dev_prefix);
-          while (*file_path == '\\') ++file_path;
+        const char* fp = path;
+        const char* dp = "\\Device\\Harddisk0\\Partition1";
+        if (strncmp(path, dp, strlen(dp)) == 0) {
+          fp = path + strlen(dp);
+          while (*fp == '\\') ++fp;
         }
-
-        uint32_t status;
-        uint32_t handle = WasmOpenFile(file_path, status);
-        if (handle && handle_ptr >= 0x1000) {
-          *(volatile uint32_t*)(base + handle_ptr) = __builtin_bswap32(handle);
-        }
-        ctx.r3.u64 = status;
+        uint32_t st;
+        uint32_t h = WasmOpenFile(fp, st);
+        if (h && handle_ptr >= 0x1000)
+          *(volatile uint32_t*)(base + handle_ptr) = __builtin_bswap32(h);
+        ctx.r3.u64 = st;
         return;
       }
     }
   }
-
   ctx.r3.u64 = 0xC0000034u;
 }
 __attribute__((weak, noinline)) void __imp__NtQueryDirectoryFile(PPCContext& ctx, uint8_t* base) {
