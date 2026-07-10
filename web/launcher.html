@@ -110,6 +110,66 @@
     };
 
     statusEl.textContent = 'Waiting for WASM module...';
+
+    // WebGPU init — runs after WASM runtime is ready
+    async function initWebGpu(canvas) {
+      if (!navigator.gpu) {
+        log('[gpu] WebGPU not available', 'warn');
+        return null;
+      }
+      log('[gpu] Requesting adapter...', 'info');
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) { log('[gpu] No adapter found', 'warn'); return null; }
+      log('[gpu] Adapter: ' + adapter.name, 'info');
+      const device = await adapter.requestDevice();
+      log('[gpu] Device acquired', 'info');
+      
+      // Configure the canvas
+      const context = canvas.getContext('webgpu');
+      context.configure({
+        device: device,
+        format: navigator.gpu.getPreferredCanvasFormat(),
+        alphaMode: 'premultiplied',
+      });
+      
+      // Store for WASM access
+      Module.webgpuDevice = device;
+      Module.webgpuContext = context;
+      Module.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+      
+      log('[gpu] WebGPU initialized ✓', 'info');
+      return { device, context };
+    }
+
+    // Simple render: clear the canvas to dark teal
+    function clearCanvas(device, context, format) {
+      const texture = context.getCurrentTexture();
+      const view = texture.createView();
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view,
+          clearValue: { r: 0.02, g: 0.12, b: 0.16, a: 1.0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+
+    // Hook into existing onRuntimeInitialized
+    const origOnRuntime = Module.onRuntimeInitialized;
+    Module.onRuntimeInitialized = function() {
+      if (origOnRuntime) origOnRuntime();
+      // Init WebGPU and clear canvas once
+      initWebGpu(Module.canvas).then(gpu => {
+        if (gpu) {
+          clearCanvas(gpu.device, gpu.context, Module.canvasFormat);
+          log('[gpu] First frame rendered ✓', 'info');
+        }
+      });
+    };
   </script>
   <script src="nhllegacy.js"></script>
 </body>
