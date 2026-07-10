@@ -1,6 +1,7 @@
 import http.server, os, sys, mimetypes
 mimetypes.add_type("application/wasm", ".wasm")
 PORT=8080
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 class H(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
