@@ -33,22 +33,29 @@
     function log(msg, cls) {
       logEl.innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
       logEl.scrollTop = logEl.scrollHeight;
+      // Also emit to browser console (paints in real-time during sync execution)
+      if (cls === 'err') origConsoleError(msg);
+      else origConsoleLog(msg);
     }
 
-    console.error = function(...a) { log(a.join(' '), 'err'); };
-    console.warn  = function(...a) { log(a.join(' '), 'warn'); };
-    console.log   = function(...a) { log(a.join(' '), 'info'); };
+    var origConsoleLog = console.log.bind(console);
+    var origConsoleWarn = console.warn.bind(console);
+    var origConsoleError = console.error.bind(console);
+    console.error = function(...a) { var m = a.join(' '); log(m, 'err'); };
+    console.warn  = function(...a) { var m = a.join(' '); log(m, 'warn'); };
+    console.log   = function(...a) { var m = a.join(' '); log(m, 'info'); };
 
     var Module = {
       print:    msg => log(msg),
       printErr: msg => log(msg, 'err'),
-      onAbort:  msg => { log('ABORT: ' + msg, 'err'); loadingEl.style.display='none'; },
+      onAbort:  msg => { log('ABORT: ' + msg, 'err'); statusEl.textContent = 'ABORT: ' + msg; loadingEl.style.display='none'; },
       setStatus: function(text) {
+        document.title = 'NHL — ' + text;
         statusEl.textContent = text;
         if (text) log(text, 'info');
       },
       onRuntimeInitialized: function() {
-        log('WASM runtime initialized', 'info');
+        log('WASM runtime initialized ✓', 'info');
         loadingEl.style.display = 'none';
       },
       canvas: (() => {
@@ -57,45 +64,52 @@
         document.body.appendChild(c);
         return c;
       })(),
-      // Monitor data downloads
+      instantiateWasm: function(info, receiveInstance) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', 'nhllegacy.wasm', true);
+        xhr.responseType = 'arraybuffer';
+        xhr.onprogress = function(e) {
+          if (e.lengthComputable) {
+            var pct = Math.round(e.loaded / e.total * 100);
+            statusEl.textContent = 'Downloading WASM... ' + pct + '%';
+            progressEl.style.width = pct + '%';
+          }
+        };
+        xhr.onload = function() {
+          statusEl.textContent = 'Compiling WASM...';
+          log('[wasm] Compiling...', 'info');
+          WebAssembly.instantiate(new Uint8Array(xhr.response), info)
+            .then(function(result) {
+              statusEl.textContent = 'Instantiating WASM...';
+              log('[wasm] Instantiating...', 'info');
+              log('[wasm] Running main()...', 'info');
+              receiveInstance(result.instance, result.module);
+              log('[wasm] main() returned', 'info');
+              statusEl.textContent = 'WASM instantiated — main() finished';
+            })
+            .catch(function(err) {
+              var msg = err.message || String(err);
+              log('[wasm] FAILED: ' + msg, 'err');
+              statusEl.textContent = 'ERROR: ' + msg;
+              if (receiveInstance) receiveInstance(null);
+            });
+        };
+        xhr.onerror = function() {
+          log('[wasm] Failed to download wasm binary', 'err');
+          statusEl.textContent = 'ERROR: download failed';
+          if (receiveInstance) receiveInstance(null);
+        };
+        xhr.send();
+        return {};
+      },
       monitorRunDependencies: function(left) {
         statusEl.textContent = left > 0
           ? `Loading data files... (${left} remaining)`
-          : 'Running...';
+          : 'Running main()...';
       }
     };
 
-    // Track .wasm download progress
-    const origFetch = window.fetch;
-    window.fetch = function(url, opts) {
-      if (typeof url === 'string' && url.endsWith('.wasm')) {
-        return origFetch(url, opts).then(response => {
-          const total = +response.headers.get('Content-Length') || 213*1024*1024;
-          const reader = response.body.getReader();
-          let loaded = 0;
-          const stream = new ReadableStream({
-            start(controller) {
-              function pump() {
-                reader.read().then(({done, value}) => {
-                  if (done) { controller.close(); return; }
-                  loaded += value.length;
-                  const pct = Math.round(loaded / total * 100);
-                  statusEl.textContent = `Downloading WASM... ${pct}%`;
-                  progressEl.style.width = pct + '%';
-                  controller.enqueue(value);
-                  pump();
-                });
-              }
-              pump();
-            }
-          });
-          return new Response(stream, { headers: response.headers });
-        });
-      }
-      return origFetch(url, opts);
-    };
-
-    statusEl.textContent = 'Fetching nhllegacy.wasm (213 MB)...';
+    statusEl.textContent = 'Waiting for WASM module...';
   </script>
   <script src="nhllegacy.js"></script>
 </body>

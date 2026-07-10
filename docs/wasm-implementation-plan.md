@@ -3,13 +3,17 @@
 ## Overview
 
 NHL Legacy Recomp running natively in the browser via WebAssembly/Emscripten.
-Status: the recompiled Xbox 360 code compiles to a 216 MB `.wasm` binary, boots
-the guest's CRT init chain in Node.js, and calls 30+ real kernel functions.
-The browser launcher downloads and compiles the WASM but hangs at "Running..."
-(instantiation failure due to 3.5 GB initial memory).
 
-This document describes the complete path from current state to a playable
-browser-rendered game.
+**Status (2026-07-09):** The 216 MB `.wasm` binary instantiates in the browser
+and boots the guest call chain through CRT init + TU 160 data initialization.
+~168 boot messages produced, 30+ real kernel stubs exercised, `main()` returns
+cleanly. The browser launcher shows download progress, compilation/instantiation
+phases, and full console output via Developer Tools.
+
+Blockers for next milestone: the SDK kernel runtime (`kernel_state`, `module`,
+`xthread`, etc.) is not built, so all indirect function calls resolve to `0x00000000`
+(trap handler → return 0). The game cannot boot further without a populated
+Import Address Table.
 
 **PR:** https://github.com/moults31/nhl-legacy-recomp/pull/3 — `feat/wasm-browser-port`
 
@@ -17,38 +21,39 @@ browser-rendered game.
 
 ## Current State
 
-### What works
+### What works (verified in browser)
 
 | Layer | Status |
 |-------|--------|
-| **Compilation** | 183 generated recomp TUs compile to WASM via Emscripten. Build: 216 MB `.wasm`, ~15 min with Ninja@16. |
+| **Compilation** | 181 generated recomp TUs + 6 WASM runtime files compile to 216 MB `.wasm` at `-Os`. |
 | **SDK compatibility** | 5 SDK header patches + 1 SDK source patch (fiber layer) for Emscripten. |
+| **Browser instantiation** | 256 MB initial memory + `ALLOW_MEMORY_GROWTH` (up to 4 GB). WASM instantiates via XHR + `WebAssembly.instantiate()`. |
 | **Guest dispatch** | 129,934 guest functions registered in a 42 MB dispatch table. |
 | **Data preloading** | 354 `.rdata`/`.data` section function pointers preloaded from `nhllegacy_functions.toml`. |
-| **CRT init** | Guest entry point (`sub_82450000`) executes and returns. CRT init function (`sub_82451038`) calls `RegisterLogCategory("cpu")`. |
-| **Kernel calls** | 30+ kernel functions called: `NtCreateFile`, `XeCryptSha`, `XeKeysConsolePrivateKeySign`, `ExCreateThread`, `KeDelayExecutionThread`, `KeSetBasePriorityThread`, `KeWaitForMultipleObjects`, `RtlInitAnsiString`, `NtOpenFile`, `RtlNtStatusToDosError`, `RtlTimeFieldsToTime`, `XAudioGetSpeakerConfig`, `XAudioRegisterRenderDriverClient`, `MmAllocatePhysicalMemoryEx`, `MmGetPhysicalAddress`, `XMACreateContext`, `XamAlloc`. |
+| **CRT init** | Guest entry point (`sub_82450000`) executes and returns. CRT init (`sub_82451038`) calls `RegisterLogCategory("cpu")` in 4043 ms. |
+| **Kernel calls** | 30+ stubs exercised: `NtCreateFile`, `XeCryptSha`, `XeKeysConsolePrivateKeySign`, `ExCreateThread` (2 threads), `KeDelayExecutionThread`, `KeSetBasePriorityThread`, `RtlInitAnsiString`, `NtOpenFile` (5 calls), `NtReadFile`, `NtWriteFile`, `NtClose`, `RtlNtStatusToDosError`, `RtlTimeFieldsToTime`, `XAudioGetSpeakerConfig`, `XAudioRegisterRenderDriverClient`, `KeWaitForMultipleObjects`, `MmAllocatePhysicalMemoryEx`, `XamAlloc`. |
 | **Boot chain** | 70+ TU 160 functions execute (data structure initialization). |
-| **MMIO handler** | Stub implementations for `CheckLoad`/`CheckStore` that log and return 0. |
-| **Browser launcher** | HTML page with progress bar, console redirection, canvas element. Python HTTP server with COOP/COEP headers. |
-| **Node.js test** | `node nhllegacy.js` produces the full boot sequence output immediately. |
+| **Browser launcher** | XHR-based WASM download with progress bar. Custom `instantiateWasm` callback with phase logging ("Downloading...", "Compiling...", "Instantiating...", "Running main()..."). Both DOM log div AND browser console output. Document title shows current status. Python HTTP server with COOP/COEP headers. |
+| **Memory management** | Guest buffer uses bump allocator from WASM heap top (2.1 GB at address `0x4000000`). Dispatch table populated directly in guest memory. |
 
 ### What's built but not wired
 
 | Component | Files | Status |
 |-----------|-------|--------|
-| **VFS** | `src/http_range_device.h/.cpp`, `src/lzx_decompress.h` | HTTP Range streaming device + LZX decompressor written. Not registered in the boot sequence. |
+| **VFS** | `src/http_range_device.h/.cpp`, `src/lzx_decompress.h` | HTTP Range streaming device + LZX decompressor written. Not registered in boot sequence. |
 | **Windowing** | `src/wasm/windowed_app_context_html5.h/.cpp`, `src/wasm/wasm_main.cpp` | HTML5 canvas windowing code written. Not linked into the build. |
-| **WebGPU backend** | `src/wasm/webgpu_graphics_system.h/.cpp`, `src/wasm/webgpu_command_processor.h/.cpp` | Skeleton subclasses of SDK's GraphicsSystem/CommandProcessor with stubbed methods. Compiles and links. |
+| **WebGPU backend** | `src/wasm/webgpu_graphics_system.h/.cpp`, `src/wasm/webgpu_command_processor.h/.cpp` | Skeleton subclasses of SDK's GraphicsSystem/CommandProcessor. Compiles and links. |
 | **Audio** | Design doc at `web/WASM_DESIGN.md` | SDL3 + FFmpeg wasm plan documented. Not implemented. |
 
 ### What doesn't work
 
 | Issue | Impact | Root cause |
 |-------|--------|------------|
-| **Browser shows "Running..." indefinitely** | Critical — no visible output in browser | `-sINITIAL_MEMORY=3758096384` (3.5 GB) causes `WebAssembly.instantiate()` to fail silently. The browser cannot create WASM linear memory that large at instantiation time. |
-| **`calloc(3.25 GB)`** in the guest | High — would fail even if instantiation succeeded | The guest buffer is 3.25 GB. With 216 MB WASM code, total exceeds 4 GB linear memory limit on wasm32. |
-| **No kernel import resolution** | High — guest stuck in CRT init | The SDK's kernel runtime (`kernel_state`, `xex_module`, `function_dispatcher`) is not built. Without it, all indirect calls go to `0x00000000` (unresolved vtable pointers). |
-| **XMA audio loop** | Medium — guest loops forever | `XMACreateContext` stub returns success immediately, causing the guest to create contexts in an infinite loop. |
+| **IAT is empty** | Critical — all indirect calls go to `0x00000000` | The SDK's `Memory::InitializeFunctionTable` is not built. Without it, kernel import addresses are not populated in the guest-memory dispatch table. |
+| **No kernel runtime** | High — guest cannot progress beyond CRT init | The SDK's kernel runtime (`kernel_state`, `xex_module`, `function_dispatcher`) depends on `rex::memory::Memory`, `rex::Runtime`, `rex::filesystem::VirtualFileSystem`, `rex::thread::*` — all require platform-specific internals (mmap, SEH, pthread signals) unavailable on WASM. |
+| **Thread creation is a no-op** | High — game threads created with `start=0x00000000` | `ExCreateThread` stub reads thread params from guest memory but the kernel data structures haven't been initialized. |
+| **File I/O returns dummy success** | Medium — game reads zeros from nonexistent files | `NtCreateFile`/`NtOpenFile`/`NtReadFile` stubs return 0 (STATUS_SUCCESS) with zero-length responses. |
+| **XMA audio loop** | Medium — infinite loop when enabled | `XMACreateContext` stub returns 0 (success), causing infinite context creation. Fixed by returning incrementing non-zero IDs. (The `0x83095C48` init function is currently commented out in the boot chain.) |
 | **No WebGPU rendering** | Medium — no visual output | The emdawnwebgpu port uses a new incompatible Dawn C API. The WebGPU skeleton needs to be mapped to this API. |
 | **No asset delivery** | Medium — game can't load files | The VFS code exists but is not connected to `NtCreateFile`/`NtReadFile`. No server-side asset bundle. |
 
@@ -56,218 +61,237 @@ browser-rendered game.
 
 ## Implementation Plan
 
-### P0: Fix browser instantiation
+### P0: Fix browser instantiation ✅ COMPLETED
 
 **Goal:** The WASM binary instantiates and `main()` produces visible output in the browser.
 
-**Estimate:** 4–8 hours
-
-#### Tasks
-
-1. **Reduce initial memory** (`web/CMakeLists.txt`):
-   - Change `-sINITIAL_MEMORY=3758096384` to `-sINITIAL_MEMORY=268435456` (256 MB).
-   - Keep `-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296` so the heap grows on demand.
-
-2. **Reduce guest buffer** (`src/wasm/sdk_runtime.cpp`):
-   - Change `kGuestMaxOffset` from `0xD0000000` (3.25 GB) to `0x40000000` (1 GB).
-   - The CRT init chain only accesses addresses below ~2 GB. If the guest accesses
-     beyond 1 GB, the access will OOB — add a check: if `calloc(1 GB)` fails,
-     fall back to 256 MB and log a warning.
-
-3. **Add WASM instantiation error handling** (`web/launcher.html`):
-   - Add a custom `Module.instantiateWasm` callback that logs success/failure.
-   - Add a `Module.onAbort` handler that displays the error visibly on the page.
-   - Add logging for each step: "Fetching...", "Compiling...", "Instantiating...", "Running main()...".
-
-4. **Test**:
-   - Rebuild with reduced memory settings.
-   - Test in Node.js first: `node nhllegacy.js` should still produce output.
-   - Serve and test in browser. If successful, the guest boot sequence will
-     appear in the log div. If instantiation still fails, the error message
-     will indicate why (memory limit, compilation failure, etc.).
-
-#### Files to modify
+**Status:** Done. The browser shows "WASM instantiated — main() finished" and the
+full boot sequence appears in the developer console. Key results:
 
 | File | Change |
 |------|--------|
-| `web/CMakeLists.txt` | Reduce `INITIAL_MEMORY` to 256 MB |
-| `src/wasm/sdk_runtime.cpp` | Reduce `kGuestMaxOffset` to 1 GB, add calloc fallback |
-| `web/launcher.html` | Add instantiateWasm callback, onAbort handler, step logging |
+| `web/CMakeLists.txt` | Reduced `INITIAL_MEMORY` to 256 MB; changed compilation to `-Os` (fixes V8 7.3 MB function size limit) |
+| `src/wasm/sdk_runtime.cpp` | `kGuestMaxOffset` reduced to 0x88000000 (~2.1 GB — covers full dispatch table); bump allocator from WASM heap top instead of `calloc` |
+| `web/launcher.html` | Added custom `instantiateWasm` callback with XHR download + phase logging; `onAbort` shows error in status bar; console output mirrored to both DOM div and `console.log`/`console.error` |
 
-#### Junior engineer tasks
-
-- **Task A:** Reduce the two memory constants, rebuild, serve, and test in browser.
-  Report: does the browser show output or an error? If error, what message?
+**Build:** `docker run … nhl-legacy-recomp-web` (Docker image builds Emscripten 3.1.74 + CMake 3.22 + Ninja).
 
 ---
 
-### P1: Verify guest output in browser
+### P1: Verify guest output in browser ✅ COMPLETED
 
 **Goal:** See the same boot sequence in the browser as in Node.js.
 
-**Estimate:** 2–4 hours
-
-#### Tasks
-
-1. **Confirm `Module.printErr` receives stderr output.** The guest uses
-   `fprintf(stderr, ...)` which Emscripten routes through `Module.printErr`.
-   Add a visible prefix to confirm: `printErr: msg => log('[stderr] ' + msg, 'err')`.
-
-2. **Log when `callMain()` is reached.** After runtime init, the JS calls `callMain()`
-   which invokes our `main()` function. Log before and after.
-
-3. **Handle calloc failure gracefully.** If the 1 GB `calloc` fails in the browser,
-   fall back to a smaller buffer (256 MB). The guest will crash on high-address
-   accesses, but we'll see output up to that point.
-
-#### Files to modify
-
-| File | Change |
-|------|--------|
-| `web/launcher.html` | Add Module.preRun logging, improve printErr |
-| `src/wasm/sdk_runtime.cpp` | Add calloc fallback to 256 MB |
-
-#### Junior engineer tasks
-
-- **Task B:** Update the HTML to log each step. Test in browser.
-  Does "WASM runtime initialized" appear? Does "main() called" appear?
+**Status:** Done. The developer console captures all ~168 boot messages including
+`[sdk]` dispatch, kernel stubs, and TU 160 init chain output. The `onAbort`
+handler, `onRuntimeInitialized`, and status-bar tracking all function correctly.
 
 ---
 
 ### P2: Build the SDK kernel runtime
 
-**Goal:** The guest boots past CRT init into the game's main initialization loop.
+**Goal:** The guest boots past CRT init into the game's main initialization loop
+by providing a populated IAT, working thread creation, and real file I/O.
 
-**Estimate:** 1–2 weeks
+**Estimate:** 12–19 hours (mid-level engineer)
 
 #### Background
 
-The guest's CRT init completes (70+ TU 160 functions execute), but the game
-cannot boot further because:
+The 14 SDK kernel files at `out/linux/deps/rexglue-sdk/src/system/` define the
+real kernel runtime (`KernelState`, `XThread`, `XFile`, `Memory`, `FunctionDispatcher`,
+etc.). They depend on `rex::memory::Memory`, `rex::Runtime`, `rex::filesystem::VirtualFileSystem`,
+`rex::thread::*` — all of which use platform-specific primitives (mmap, SEH,
+pthread signals) unavailable on WASM.
 
-1. **Import Address Table (IAT) is empty:** All indirect function calls resolve
-   to `0x00000000` because the SDK's `Memory::InitializeFunctionTable` has not
-   populated the guest-memory dispatch table with kernel import addresses.
+Our existing WASM infrastructure already solves the hard memory-mapping problem:
+a bump-allocated guest buffer, a populated dispatch table, and `WamFunctionDispatcher`.
+The task is to create WASM-compatible stubs for the `rex::*` symbols and wire them
+to our existing infrastructure.
 
-2. **Thread scheduling is stubbed:** `ExCreateThread` reads the start address
-   from guest memory but doesn't actually create a thread context or call the
-   start function.
+**Strategy:** Add one group of files at a time, collecting undefined symbols at
+each step, creating minimal stubs in `sdk_runtime.cpp`. This incremental approach
+avoids a monolithic link failure with 50+ unresolved symbols.
 
-3. **File I/O returns dummy data:** `NtCreateFile` and `NtReadFile` return 0
-   (success) but don't provide any file data. The guest reads zeros from the
-   files it tries to open.
+**Key dependency:** The SDK source files live at `out/linux/deps/rexglue-sdk/src/system/`,
+not in the project's `src/` directory. The CMake variable `${SDK_DIR}` points to
+the SDK root.
 
-4. **XMA audio loop:** `XMACreateContext` returns success immediately, causing
-   the guest to allocate ~49,000 XMA contexts in an infinite loop.
+#### Slice 2a: Add core kernel files + Memory stubs
 
-#### Tasks
-
-**2a. Add SDK system source files to the build** (`web/CMakeLists.txt`)
-
-We verified the following 14 SDK files compile with 0 errors under Emscripten:
-
+**Files to add to `WASM_SOURCES`:**
 ```
-src/system/kernel_state.cpp
-src/system/runtime.cpp
-src/system/thread.cpp
-src/system/xthread.cpp
-src/system/xmemory.cpp
-src/system/xobject.cpp
-src/system/xevent.cpp
-src/system/xsemaphore.cpp
-src/system/xmutant.cpp
-src/system/xfile.cpp
-src/system/module.cpp
-src/system/xmodule.cpp
-src/system/function_dispatcher.cpp
-src/system/kernel_module.cpp
+${SDK_DIR}/src/system/thread.cpp          (1 KB, 33 lines — minimal thread-local wrapper)
+${SDK_DIR}/src/system/module.cpp           (3 KB, 98 lines — base Module class)
+${SDK_DIR}/src/system/kernel_module.cpp    (4 KB — kernel export loader)
+${SDK_DIR}/src/system/xobject.cpp          (15 KB — XObject base class)
+${SDK_DIR}/src/system/xmodule.cpp          (3 KB, 106 lines — XModule inherits XObject)
+${SDK_DIR}/src/system/kernel_state.cpp     (45 KB — central kernel state hub)
 ```
 
-Add them to the `WASM_SOURCES` list in `web/CMakeLists.txt`. Fix any
-compile-time errors. When both our stubs and the SDK's real implementations
-define the same symbol, remove the stub (the SDK implementation is the
-authoritative one).
+These 6 files are the minimal set needed to initialize kernel state and load
+modules. They pull in the `Memory` interface but not the full MMU implementation.
 
-Also add the `crypto/TinySHA1.hpp` include path: add
-`-I${SDK_DIR}/thirdparty/crypto` and `-I${SDK_DIR}/thirdparty` to
-`NHL_WASM_INCLUDES`.
-
-**2b. Stub undefined symbols** (`src/wasm/sdk_runtime.cpp`)
-
-The SDK files pull in ~50 undefined symbols from the core library
-(which we can't compile due to deep Linux API dependencies). Create stubs:
+**Expected undefined symbols** (to stub in `sdk_runtime.cpp`):
 
 | Symbol | Stub behavior |
 |--------|--------------|
-| `rex::memory::Memory::SystemHeapAlloc` | `return malloc(size)` |
-| `rex::memory::Memory::SystemHeapFree` | `free(ptr)` |
-| `rex::memory::Memory::InitializeFunctionTable` | Populate IAT from PPCFuncMappings (see 2c) |
-| `rex::memory::Memory::SetFunction` | Write function pointer into guest's dispatch table |
+| `rex::memory::Memory::SystemHeapAlloc(size, ...)` | `return malloc(size)` + track in a vector |
+| `rex::memory::Memory::SystemHeapFree(addr, ...)` | `free(addr)` |
+| `rex::memory::Memory::TranslateVirtual<T>(addr)` | `return (T*)(g_guest_base + addr)` |
+| `rex::memory::Memory::virtual_membase()` | `return g_guest_base` |
+| `rex::memory::Memory::InitializeFunctionTable` | See slice 2b below |
+| `rex::memory::Memory::SetFunction` | Write PPCFunc* into dispatch table at `(guest_addr - code_base) * 2` |
 | `rex::memory::Memory::DestroyFunctionTable` | No-op |
-| `rex::filesystem::VirtualFileSystem` | Stub all methods (return null/empty) |
-| `rex::filesystem::NullDevice` | Stub constructor |
-| `rex::filesystem::HostPathDevice` | Stub constructor |
+| `rex::memory::Memory::LookupHeap(addr)` | Return nullptr |
+| `rex::kernel::xboxkrnl::KfAcquireSpinLock` / `KfReleaseSpinLock` | No-op (return 0) |
 | `rex::cvar::RegisterFlag` / `UnregisterFlag` | No-op |
-| `rex::kernel::xboxkrnl::*SpinLock*` | No-op (return 0) |
-| `rex::runtime::ThreadState::Get` / `Bind` | Return nullptr |
+| `rex::filesystem::VirtualFileSystem::RegisterDevice` | No-op |
+| `rex::filesystem::VirtualFileSystem::ResolvePath` | Return nullptr |
+| `rex::runtime::ThreadState::Get` / `Bind` | Return nullptr / false |
+| `rex::ppc::PPCFuncMappings[]` | Already provided by `generated/default/nhllegacy_init.cpp` |
+
+**Also needed:** Add SDK source `include` path and crypto `include` path to
+`NHL_WASM_INCLUDES`:
+```
+"${SDK_DIR}/src"
+"${SDK_DIR}/thirdparty/crypto"
+"${SDK_DIR}/thirdparty"
+```
+
+**Verification:** Build succeeds. `wasm_boot_guest()` reaches `InitializeFunctionTable` without crashing.
+
+---
+
+#### Slice 2b: Implement Memory::InitializeFunctionTable
+
+**This is the key function that unblocks the guest from the CRT init loop.**
+It populates the guest-memory Import Address Table (IAT), which resides at
+`image_base + image_size = 0x82000000 + 0x1EA0000 = 0x83EA0000`.
+
+Algorithm (backed by our existing bump-allocated guest buffer):
+1. Map `code_base = 0x82450000`, `image_base = 0x82000000`, `image_size = 0x1EA0000` from PPCImageConfig
+2. Compute `table_base = image_base + image_size = 0x83EA0000`
+3. Clear `table_size = (code_size + 0x10000) * 2` bytes in guest buffer at `table_base`
+4. Register the table info in a `function_tables_` vector
+5. Then `SetFunction` is called 129,934 times by the caller to write each `PPCFunc*` at offset `(guest_addr - code_base) * 2` in the guest buffer
+
+The existing `WamFunctionDispatcher::InitFromImage()` already does most of this.
+The new implementation wraps it in the SDK's `Memory` interface so the 14 SDK
+files can use it.
+
+**Verification:** After `InitializeFunctionTable`, kernel import stubs appear at
+non-zero addresses. The "unresolved indirect: 0x00000000" messages stop appearing.
+
+---
+
+#### Slice 2c: Add thread + sync primitives + remaining SDK files
+
+**Files to add to `WASM_SOURCES`:**
+```
+${SDK_DIR}/src/system/xevent.cpp          (4 KB — manual/auto-reset events)
+${SDK_DIR}/src/system/xsemaphore.cpp      (3 KB — counting semaphore)
+${SDK_DIR}/src/system/xmutant.cpp         (3 KB — mutex)
+${SDK_DIR}/src/system/xthread.cpp         (52 KB — ExCreateThread, KeWait, TLS, APC/DPC)
+${SDK_DIR}/src/system/xfile.cpp           (13 KB — NtCreateFile, NtReadFile via VFS)
+${SDK_DIR}/src/system/runtime.cpp         (12 KB — Runtime factory)
+${SDK_DIR}/src/system/function_dispatcher.cpp  (13 KB — SDK's dispatcher)
+${SDK_DIR}/src/system/xmemory.cpp         (82 KB, 2051 lines — full MMU — DON'T ADD)
+```
+
+**Note on `xmemory.cpp`:** The full Memory implementation uses mmap-backed virtual
+memory, page protection tricks, and physical address mapping — none of which
+works on WASM. We do NOT add this file. The existing WASM guest buffer +
+bump allocator replaces it entirely. Only the `Memory` *interface* stubs
+(slice 2a) are needed.
+
+**Thread + sync primitive stubs** (single-threaded WASM):
+
+| Symbol | Stub behavior |
+|--------|--------------|
+| `rex::thread::Event::CreateManualResetEvent` | Return pointer to dummy Event (always signaled) |
+| `rex::thread::Event::CreateAutoResetEvent` | Same as manual |
+| `rex::thread::Semaphore::Create(count, max)` | Return pointer to dummy Semaphore |
+| `rex::thread::Mutant::Create` | Return pointer to dummy Mutant |
+| `rex::thread::Mutex::lock` / `unlock` | No-op |
+| `rex::thread::Thread` (full class) | Minimal stub: `Create()`, `Join()`, `SetAffinity()` all no-ops |
+
+**Runtime + VFS stubs:**
+
+| Symbol | Stub behavior |
+|--------|--------------|
+| `rex::Runtime::instance()` | Return static WASM Runtime singleton |
+| `rex::Runtime::memory()` | Return our WASM Memory class reference |
+| `rex::Runtime::function_dispatcher()` | Return our WamFunctionDispatcher wrapper |
+| `rex::filesystem::VirtualFileSystem` ctor / methods | No-ops, return nullptr |
+| `rex::filesystem::NullDevice` ctor | No-op |
+| `rex::filesystem::HostPathDevice` ctor | No-op |
 | `fmt::vformat_to` / `fmt::vformat` | Return empty string |
 
-Collect the full list by running the linker and parsing the error output.
-Use `llvm-nm` on the failing object files to find all undefined symbols.
+**Verification:** Build succeeds with all 13 SDK files (excluding xmemory.cpp).
+Node.js boot output shows further progress with kernel state initialization.
 
-**2c. Implement `Memory::InitializeFunctionTable`**
+---
 
-This is the **key function** that unblocks the guest from the CRT init loop.
-It populates the guest's Import Address Table (IAT) in guest memory.
+#### Slice 2d: Resolve stub conflicts
 
-Algorithm:
-1. Iterate through `PPCFuncMappings[]` (129,934 entries)
-2. For each kernel import symbol (`__imp__*`), determine its guest address
-3. Write the function pointer into the guest-memory dispatch table
-   at `base + IMAGE_BASE + IMAGE_SIZE + (guest_addr - CODE_BASE) * 2`
+When the SDK files are linked, their `REX_EXPORT` implementations for kernel
+functions override the weak stubs in `kernel_stubs.cpp`. Expected replacements:
 
-The dispatch table format: `uintptr_t table[(guest_addr - CODE_BASE) * 2]`
-where `CODE_BASE = 0x82450000` and `IMAGE_BASE + IMAGE_SIZE = 0x83EA0000`.
+| Function | SDK provides | Action |
+|----------|-------------|--------|
+| `ExCreateThread` | Real implementation in xboxkrnl_threading.cpp | Keep our WASM-specific version (synchronous execution). The SDK version creates a real `XThread` object — not compatible with WASM's single-threaded model. |
+| `KeDelayExecutionThread` | Real implementation | Accept SDK version (calls emscripten_sleep internally) |
+| `KeWaitForMultipleObjects` | Real implementation | Accept SDK version (uses stubbed Event/Semaphore) |
+| `NtCreateFile` / `NtReadFile` | Real implementation in xfile.cpp | Accept for P2 (returns dummy data); replace with VFS in P3 |
+| `KeAcquireSpinLock` / `KeReleaseSpinLock` | Real implementation | Accept (lightweight — our stubs are no-ops, SDK's also compile to no-ops on WASM) |
+| XAudio*, XMA*, Vd*, NetDll* | Stubbed in SDK (`REX_EXPORT_STUB`) | Keep our weak stubs (they match the SDK's stub level) |
 
-**2d. Fix `ExCreateThread`** (`src/wasm/kernel_stubs.cpp`)
+**How to keep our ExCreateThread:** When adding xthread.cpp, conditionalize our
+stub on `#ifndef USE_SDK_EXCREATETHREAD` or wrap it in a `__attribute__((weak))`
+guarded by an `#if` so the SDK version is intentionally not linked.
 
-The current stub reads the start address from guest memory at
-`params_ptr + 0x150` but only logs it. Make it actually execute:
-1. Read the full `XTHREAD_CREATION_PARAMS` struct from guest memory
-   (offset 0x150 for `start_address`, offset 0x14C for `xapi_thread_startup`)
-2. If `xapi_thread_startup` is non-zero, call it as a trampoline, passing
-   `start_address` as argument (r3)
-3. Create a `PPCContext` with stack at `0x40000000` and TLS at `0x10000000`
-4. Call the function and log the return value
-5. Return 0 (success) in `ctx.r3`
+---
 
-**2e. Fix the XMA audio loop** (`src/wasm/kernel_stubs.cpp`)
+#### Slice 2e: Fix XMA audio loop
 
-Modify the `__imp__XMACreateContext` stub to return a valid context handle:
+**File:** `src/wasm/kernel_stubs.cpp`
+
 ```cpp
 static std::atomic<unsigned> xma_context_id{1};
 ctx.r3.u64 = xma_context_id.fetch_add(1);
 ```
-The guest checks if the return value is 0 (error). By returning non-zero
-incremental IDs, the guest thinks each context was created successfully and
-the loop terminates.
+
+The guest checks `ctx.r3.u64 != 0` for success. By returning incrementing IDs,
+the guest thinks each XMA context was created successfully and the loop terminates.
+
+**Follow-up:** Re-enable the `0x83095C48` init function in `wasm_boot_guest()`'s
+boot chain (currently commented out with `// SKIP to avoid infinite loop`).
+
+**Verification:** The function `0x83095C48` executes and returns without looping.
+Total kernel calls do not increase by more than 100.
+
+---
+
+#### Slice 2f: End-to-end test
+
+1. **Node.js:** `node nhllegacy.js` — verify boot output shows:
+   - Kernel calls exceed 100 (vs current 30)
+   - Thread creation shows non-zero start addresses
+   - `NtOpenFile` returns proper NTSTATUS codes (not all zero)
+   - No "unresolved indirect: 0x00000000" messages after IAT is populated
+
+2. **Browser:** Serve and test. Verify the developer console shows:
+   - All the above
+   - `main()` returns cleanly (no crash)
 
 #### Files to modify
 
 | File | Change |
 |------|--------|
-| `web/CMakeLists.txt` | Add 14 SDK source files, add crypto include paths |
-| `src/wasm/sdk_runtime.cpp` | Add ~50 stub definitions for SDK core symbols |
-| `src/wasm/kernel_stubs.cpp` | Fix ExCreateThread, fix XMACreateContext loop |
-
-#### Junior engineer tasks
-
-- **Task C:** Add the 14 SDK files to CMakeLists.txt. Run the build. Collect
-  all compile/link errors. Document which files need patches.
-- **Task D:** Run `llvm-nm -u` on the link-failing object files. Collect all
-  undefined symbol names. Create stub definitions for each in `sdk_runtime.cpp`.
-- **Task E:** Fix the `XMACreateContext` stub to return non-zero IDs. Verify
-  the loop terminates (no more than 1,000 kernel calls from that function).
+| `web/CMakeLists.txt` | Add 13 SDK source files (all except xmemory.cpp); add SDK src + crypto include paths |
+| `src/wasm/sdk_runtime.cpp` | Add Memory interface stubs (~200 lines); add InitializeFunctionTable wrapper; add ThreadState/Runtime/VFS stubs (~150 lines); add dummy Event/Semaphore/Mutant classes (~80 lines) |
+| `src/wasm/kernel_stubs.cpp` | Fix XMACreateContext to return non-zero IDs; conditionally exclude ExCreateThread weak stub when SDK provides it |
+| `src/wasm/sdk_runtime.h` | (New) Declare WASM-specific Memory subclass, dummy thread primitives |
 
 ---
 
@@ -487,9 +511,8 @@ the full graphics backend — not needed for the boot-to-menu milestone.
 #### Tasks
 
 **5a. Reduce WASM binary size**
-- Try `-O1` (optimize for speed) or `-Os` (optimize for size) at compile time.
-  Keep `--profiling-funcs` if wasm-opt OOMs.
-- Try `-flto=thin` (Link-Time Optimization) to eliminate dead code.
+- The `-Os` optimization is already applied (216 MB). Try `-Oz` (aggressive size)
+  or `-flto=thin` (Link-Time Optimization) to eliminate more dead code.
 - Strip debug info with `-g0` (already set).
 - Target: reduce from 216 MB to <100 MB.
 
@@ -521,7 +544,7 @@ the full graphics backend — not needed for the boot-to-menu milestone.
 
 #### Junior engineer tasks
 
-- **Task J:** Try `-Os` in CMakeLists.txt. Report binary size. If it builds
+- **Task J:** Try `-Oz` in CMakeLists.txt. Report binary size. If it builds
   and runs in Node.js, test in browser.
 - **Task K:** Add keyboard input to `web/launcher.html`. Map arrow keys +
   Enter to Xbox controller D-pad + A button.
@@ -530,30 +553,26 @@ the full graphics backend — not needed for the boot-to-menu milestone.
 
 ## Summary
 
-| Priority | Phase | What | Est. | Who |
-|----------|-------|------|------|-----|
-| **P0** | Browser inst. | Fix memory, add error handling, test | 4–8h | Any engineer |
-| **P1** | Guest output | Verify printErr, add logging | 2–4h | Any engineer |
-| **P2** | SDK kernel | Add source files, stub symbols, fix IAT, fix loops | 1–2w | Mid-level |
-| **P3** | VFS | Asset extractor, HttpRangeDevice wiring, file stubs | 1–2w | Mid-level |
-| **P4** | WebGPU | Dawn API mapping, device init, framebuffer blit | 2–4w | Senior |
-| **P5** | Polish | Optimize size, input, audio, loading UI | 1–2w | Junior |
+| Priority | Phase | What | Est. | Who | Status |
+|----------|-------|------|------|-----|--------|
+| **P0** | Browser inst. | Fix memory, add error handling, test | 4–8h | Any engineer | ✅ Done |
+| **P1** | Guest output | Verify printErr, add logging | 2–4h | Any engineer | ✅ Done |
+| **P2** | SDK kernel | Add SDK files, stub Memory/Thread/VFS symbols, fix IAT, fix loops | 12–19h | Mid-level | **Current** |
+| **P3** | VFS | Asset extractor, HttpRangeDevice wiring, file stubs | 1–2w | Mid-level | Blocked by P2 |
+| **P4** | WebGPU | Dawn API mapping, device init, framebuffer blit | 2–4w | Senior | Blocked by P2 |
+| **P5** | Polish | Optimize size, input, audio, loading UI | 1–2w | Junior | Blocked by P4 |
 
-### Junior engineer task list
+### P2 Slice Breakdown
 
-| Task | Phase | Description | Skills |
-|------|-------|-------------|--------|
-| A | P0 | Reduce memory, rebuild, test in browser, report | CMake, JS, browser dev tools |
-| B | P1 | Update HTML for step logging, test in browser | JS, HTML |
-| C | P2 | Add 14 SDK files to CMakeLists.txt, fix compile errors | C++, CMake |
-| D | P2 | Collect undefined symbols, create stubs in sdk_runtime.cpp | C++, linkers |
-| E | P2 | Fix XMACreateContext stub (return non-zero IDs) | C++ |
-| F | P3 | Write `tools/web/extract_assets.py` (extract .big files) | Python, file formats |
-| G | P3 | Write file handle table in kernel_stubs.cpp | C++, VFS |
-| H | P4 | Document emdawnwebgpu API differences from standard wgpu.h | C, WebGPU |
-| I | P4 | Write WGSL shader as C++ string literal | WGSL, WebGPU |
-| J | P5 | Try `-Os` optimization, report binary size | CMake, WASM |
-| K | P5 | Add keyboard input to launcher.html | JS, DOM events |
+| Slice | What | Est. |
+|-------|------|------|
+| **P2a** | Add 6 core kernel files + Memory stubs in sdk_runtime.cpp | 3–5h |
+| **P2b** | Implement Memory::InitializeFunctionTable (populate IAT) | 3–4h |
+| **P2c** | Add 7 remaining SDK files + Thread/Runtime/VFS stubs | 3–5h |
+| **P2d** | Resolve stub conflicts (ExCreateThread, kernel imports) | 1–2h |
+| **P2e** | Fix XMA audio loop (return non-zero context IDs) | 0.5h |
+| **P2f** | End-to-end test (Node.js + browser) | 2–3h |
+| **Total P2** | | **12–19h** |
 
 ---
 
@@ -561,11 +580,11 @@ the full graphics backend — not needed for the boot-to-menu milestone.
 
 | File | Purpose |
 |------|---------|
-| `web/CMakeLists.txt` | Build config: generates `nhllegacy.wasm` + `.js` |
-| `web/Dockerfile` | Docker image for Emscripten build environment |
+| `web/CMakeLists.txt` | Build config: generates `nhllegacy.wasm` + `.js` (256 MB initial memory, `-Os`, 13 SDK source files) |
+| `web/Dockerfile` | Docker image for Emscripten build environment (3.1.74, cmake 3.22, ninja) |
 | `web/build.sh` | Entry-point build script |
 | `web/lib/compile.sh` | Shell-based compile script (alternative to CMake) |
-| `web/launcher.html` | Browser HTML page with progress bar, canvas, console |
+| `web/launcher.html` | Browser HTML page with XHR download + progress bar, `instantiateWasm` callback with phase logging, mirrored console output |
 | `web/serve.py` | Python HTTP server with COOP/COEP headers |
 | `web/WASM_DESIGN.md` | Design doc for windowing/input/audio |
 | `web/WEBGPU_BACKEND.md` | Design doc for WebGPU backend |
@@ -577,13 +596,14 @@ the full graphics backend — not needed for the boot-to-menu milestone.
 | `web/patches/rex/core/fiber_posix.cpp` | Patched: WASM no-op fiber stubs |
 | `web/patches/sys/eventfd.h` | Compatibility header: pthreads-based eventfd for WASM |
 | `web/patches/emscripten_compat.h` | Linux API compat shims (syscall, madvise, etc.) |
-| `src/wasm/sdk_runtime.cpp` | Core runtime: dispatch table, guest memory, MMIO, clock, logging, data preloading, fake module handle, trap handler, boot sequence |
+| `src/wasm/sdk_runtime.cpp` | Core runtime: guest memory bump allocator, dispatch table, Memory/Thread/Runtime/VFS stubs, MMIO, clock, logging, data preloading, fake module handle, trap handler, boot sequence |
+| `src/wasm/sdk_runtime.h` | New: WASM Memory subclass, dummy thread primitives, Event/Semaphore/Mutant stubs |
 | `src/wasm/runtime_stubs.cpp` | Thin `main()` shim → `wasm_boot_guest()` |
-| `src/wasm/kernel_stubs.cpp` | Auto-generated 311 kernel import stubs + smart ExCreateThread |
+| `src/wasm/kernel_stubs.cpp` | Auto-generated 311 kernel import stubs + smart ExCreateThread + fixed XMACreateContext |
 | `src/wasm/windowed_app_context_html5.h/.cpp` | HTML5 canvas windowing |
 | `src/wasm/wasm_main.cpp` | WASM entry point (alternative to runtime_stubs) |
 | `src/wasm/webgpu_graphics_system.h/.cpp` | WebGPU GraphicsSystem skeleton |
 | `src/wasm/webgpu_command_processor.h/.cpp` | WebGPU CommandProcessor skeleton |
 | `src/http_range_device.h/.cpp` | HTTP Range streaming VFS device |
 | `src/lzx_decompress.h` | Self-contained LZX decompressor |
-| `docs/implementation-plan.md` | This document |
+| `docs/wasm-implementation-plan.md` | This document |

@@ -1,6 +1,6 @@
 # WASM build — produces nhllegacy.wasm from generated recomp + SDK runtime.
 # Usage: source /tmp/emsdk/emsdk_env.sh && emcmake cmake -S web -B out/wasm/build -G Ninja
-cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.22)
 project(nhllegacy-wasm LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -30,7 +30,7 @@ set(NHL_WASM_INCLUDES
 file(GLOB GENERATED_SOURCES "${GENERATED_DIR}/*.cpp")
 add_library(nhllegacy_recomp STATIC ${GENERATED_SOURCES})
 target_include_directories(nhllegacy_recomp PRIVATE ${NHL_WASM_INCLUDES})
-target_compile_options(nhllegacy_recomp PRIVATE -Wno-deprecated-pragma)
+target_compile_options(nhllegacy_recomp PRIVATE -Os -pthread -sWASM_BIGINT -Wno-deprecated-pragma)
 
 # ----- executable -----
 set(WASM_SOURCES
@@ -54,12 +54,12 @@ target_compile_options(nhllegacy PRIVATE -Wno-deprecated-pragma)
 target_link_libraries(nhllegacy PRIVATE nhllegacy_recomp)
 
 target_link_options(nhllegacy PRIVATE
-  -O0
+  -Os
   -g0
   -sWASM_BIGINT
   -sALLOW_MEMORY_GROWTH=1
   -sMAXIMUM_MEMORY=4294967296
-  -sINITIAL_MEMORY=3758096384
+  -sINITIAL_MEMORY=268435456
   -sSTACK_SIZE=4MB
   -sERROR_ON_UNDEFINED_SYMBOLS=0
   -Wl,--allow-undefined

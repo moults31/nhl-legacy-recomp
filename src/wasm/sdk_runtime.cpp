@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <emscripten.h>
+#include <emscripten/heap.h>
 
 #include <rex/ppc.h>
 #include <rex/ppc/context.h>
@@ -63,19 +64,42 @@ static void timeout_check() {
 // Dispatch table at 0x82000000 + 0x1EA0000 = 0x83EA0000
 // Table size = code_size * 2 + thunk_reserve * 2 ≈ 0x2A9CA60
 // 3 GB covers most of the 4 GB space. OOB beyond this is rare.
-static constexpr size_t kGuestMaxOffset = 0xD0000000ull; // ~3.25 GB
+static constexpr size_t kGuestMaxOffset = 0x88000000ull; // ~2.125 GB — covers dispatch table at 0x83EA0000 + table_size
 static uint8_t* g_guest_base = nullptr;
 static std::atomic<bool> g_mem_logged{false};
 
 uint8_t* wasm_guest_base() {
   if (!g_mem_logged.exchange(true)) {
-    g_guest_base = (uint8_t*)std::calloc(kGuestMaxOffset, 1);
-    if (!g_guest_base) {
-      std::fprintf(stderr, "[sdk] FATAL: calloc(%zu) failed\n", (size_t)kGuestMaxOffset);
-      std::abort();
+    // Allocate guest buffer from WASM linear memory directly.
+    // Use the heap allocator to reserve space at the top of memory,
+    // past the dlmalloc managed region. We align to a 64KB boundary
+    // and allocate exactly kGuestMaxOffset bytes.
+    size_t total_needed = kGuestMaxOffset + 64 * 1024 * 1024;
+    if (emscripten_resize_heap(total_needed)) {
+      // After resize, sbrk/brk top is at the old heap limit.
+      // Use a manual bump allocator from the top of the heap.
+      // We rely on the fact that after resize, the pages are committed.
+      size_t heap_size = emscripten_get_heap_size();
+      size_t alloc_start = heap_size - kGuestMaxOffset;
+      alloc_start &= ~0xFFFFull;
+      g_guest_base = (uint8_t*)alloc_start;
+      std::fprintf(stderr, "[sdk] bump alloc: heap=%zuMB guest_base=%p\n",
+                   heap_size / (1024 * 1024), (void*)g_guest_base);
+    } else {
+      std::fprintf(stderr, "[sdk] WARNING: heap resize to %zuMB failed\n",
+                   total_needed / (1024 * 1024));
+      g_guest_base = (uint8_t*)std::calloc(kGuestMaxOffset, 1);
+      if (!g_guest_base) {
+        static constexpr size_t kFallbackOffset = 0x10000000ull;
+        g_guest_base = (uint8_t*)std::calloc(kFallbackOffset, 1);
+      }
+      if (!g_guest_base) {
+        std::fprintf(stderr, "[sdk] FATAL: calloc fallback also failed\n");
+        std::abort();
+      }
+      std::fprintf(stderr, "[sdk] guest memory: %.1fGB @ %p (calloc fallback)\n",
+                   (double)kGuestMaxOffset / (1024 * 1024 * 1024), (void*)g_guest_base);
     }
-    std::fprintf(stderr, "[sdk] guest memory: %.1fGB @ %p\n",
-                 (double)kGuestMaxOffset / (1024 * 1024 * 1024), (void*)g_guest_base);
   }
   return g_guest_base;
 }
