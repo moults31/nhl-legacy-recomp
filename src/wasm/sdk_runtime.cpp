@@ -17,7 +17,9 @@
 #include <chrono>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -33,6 +35,16 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/perf/counter.h>
+#include <rex/string.h>
+#include <rex/stream.h>
+#include <rex/filesystem/vfs.h>
+#include <rex/filesystem/devices/null_device.h>
+#include <rex/filesystem/devices/host_path_device.h>
+#include <rex/system/xmemory.h>
+#include <rex/system/function_dispatcher.h>
+#include <rex/runtime.h>
+#include "vfs_bridge.h"
+#include "http_range_device.h"
 
 // Timeout handler
 // Note: WASM is single-threaded and synchronous. If the guest enters a tight
@@ -225,6 +237,8 @@ void DebugPrint(const char*) {}
 namespace rex::cvar {
 std::vector<std::string> Init(int, char**) { return {}; }
 void ApplyEnvironment() {}
+std::optional<size_t> RegisterFlag(FlagEntry) { return std::nullopt; }
+void UnregisterFlag(std::string_view) {}
 }  // namespace rex::cvar
 
 // ---- Clock (declared in rex/chrono/clock.h, not inline) --------------------
@@ -310,6 +324,379 @@ void initialize_seh() {}
 
 
 // ============================================================================
+// SDK Memory stubs — WASM-compatible replacements for mmap-backed Memory.
+// ============================================================================
+
+static std::unordered_map<uint32_t, PPCFunc*> g_wasm_func_map;
+
+namespace rex::memory {
+
+// --- BaseHeap / VirtualHeap / PhysicalHeap -----------------------------------
+BaseHeap::BaseHeap() : membase_(nullptr), heap_base_(0), heap_size_(0), page_size_(0) {}
+BaseHeap::~BaseHeap() = default;
+void BaseHeap::Dispose() {}
+void BaseHeap::DumpMap() {}
+
+bool BaseHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_type,
+                     uint32_t protect, bool top_down, uint32_t* out_address) {
+  if (out_address) *out_address = 0;
+  return true;
+}
+bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignment,
+                          uint32_t allocation_type, uint32_t protect) { return true; }
+bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t size,
+                          uint32_t alignment, uint32_t allocation_type, uint32_t protect,
+                          bool top_down, uint32_t* out_address) {
+  if (out_address) *out_address = 0;
+  return true;
+}
+bool BaseHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t allocation_type,
+                               uint32_t protect, bool top_down, uint32_t* out_address) {
+  return Alloc(size, alignment, allocation_type, protect, top_down, out_address);
+}
+bool BaseHeap::Decommit(uint32_t address, uint32_t size) { return true; }
+bool BaseHeap::Release(uint32_t address, uint32_t* out_region_size) { return true; }
+bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
+                       uint32_t* old_protect) { return true; }
+bool BaseHeap::QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info) {
+  return false;
+}
+bool BaseHeap::QuerySize(uint32_t address, uint32_t* out_size) { return false; }
+bool BaseHeap::QueryBaseAndSize(uint32_t* in_out_address, uint32_t* out_size) { return false; }
+bool BaseHeap::QueryProtect(uint32_t address, uint32_t* out_protect) { return false; }
+rex::memory::PageAccess BaseHeap::QueryRangeAccess(uint32_t low_address, uint32_t high_address) {
+  return rex::memory::PageAccess::kReadWrite;
+}
+bool BaseHeap::Save(stream::ByteStream* stream) { return true; }
+bool BaseHeap::Restore(stream::ByteStream* stream) { return true; }
+void BaseHeap::Reset() {}
+
+VirtualHeap::VirtualHeap() = default;
+VirtualHeap::~VirtualHeap() = default;
+void VirtualHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type,
+                             uint32_t heap_base, uint32_t heap_size, uint32_t page_size) {
+  BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size);
+}
+
+PhysicalHeap::PhysicalHeap() : parent_heap_(nullptr) {}
+PhysicalHeap::~PhysicalHeap() = default;
+bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_type,
+                         uint32_t protect, bool top_down, uint32_t* out_address) {
+  return BaseHeap::Alloc(size, alignment, allocation_type, protect, top_down, out_address);
+}
+bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignment,
+                              uint32_t allocation_type, uint32_t protect) { return true; }
+bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t size,
+                              uint32_t alignment, uint32_t allocation_type, uint32_t protect,
+                              bool top_down, uint32_t* out_address) {
+  return BaseHeap::AllocRange(low_address, high_address, size, alignment, allocation_type,
+                              protect, top_down, out_address);
+}
+bool PhysicalHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t allocation_type,
+                                   uint32_t protect, bool top_down, uint32_t* out_address) {
+  return true;
+}
+bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) { return true; }
+bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) { return true; }
+bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
+                           uint32_t* old_protect) { return true; }
+
+// --- Memory ------------------------------------------------------------------
+
+Memory::Memory() : virtual_membase_(nullptr), physical_membase_(nullptr) {}
+Memory::~Memory() = default;
+
+bool Memory::Initialize() {
+  virtual_membase_ = wasm_guest_base();
+  physical_membase_ = virtual_membase_;
+  system_page_size_ = 4096;
+  system_allocation_granularity_ = 65536;
+  return true;
+}
+void Memory::Reset() {}
+
+uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment, uint32_t system_heap_flags) {
+  if (g_guest_base == nullptr) return 0;
+  static uint32_t next_alloc = 0x30000000;
+  uint32_t result = next_alloc;
+  next_alloc += (size + alignment - 1) & ~(alignment - 1);
+  if (next_alloc > kGuestMaxOffset) next_alloc = 0x30000000;
+  return result;
+}
+void Memory::SystemHeapFree(uint32_t address, uint32_t* out_region_size) {
+  if (out_region_size) *out_region_size = 0;
+}
+
+void Memory::Zero(uint32_t address, uint32_t size) {
+  std::memset(virtual_membase_ + address, 0, size);
+}
+void Memory::Fill(uint32_t address, uint32_t size, uint8_t value) {
+  std::memset(virtual_membase_ + address, value, size);
+}
+void Memory::Copy(uint32_t dest, uint32_t src, uint32_t size) {
+  std::memcpy(virtual_membase_ + dest, virtual_membase_ + src, size);
+}
+
+uint32_t Memory::HostToGuestVirtual(const void* host_address) const {
+  return static_cast<uint32_t>(
+      static_cast<const uint8_t*>(host_address) - virtual_membase_);
+}
+uint32_t Memory::GetPhysicalAddress(uint32_t address) const { return address; }
+uint32_t Memory::SearchAligned(uint32_t start, uint32_t end, const uint32_t* values,
+                                size_t value_count) { return 0; }
+
+bool Memory::AddVirtualMappedRange(uint32_t virtual_address, uint32_t mask, uint32_t size,
+                                    void* context,
+                                    runtime::MMIOReadCallback read_callback,
+                                    runtime::MMIOWriteCallback write_callback) { return true; }
+runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) { return nullptr; }
+
+const BaseHeap* Memory::LookupHeap(uint32_t address) const { return nullptr; }
+BaseHeap* Memory::LookupHeapByType(bool physical, uint32_t page_size) { return nullptr; }
+void Memory::GetHeapsPageStatsSummary(const BaseHeap* const* provided_heaps, size_t heaps_count,
+                                       uint32_t& unreserved_pages, uint32_t& reserved_pages,
+                                       uint32_t& used_pages, uint32_t& reserved_bytes) {}
+VirtualHeap* Memory::GetPhysicalHeap() { return nullptr; }
+void Memory::DumpMap() {}
+
+bool Memory::Save(stream::ByteStream* stream) { return true; }
+bool Memory::Restore(stream::ByteStream* stream) { return true; }
+
+bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size,
+                                      uint32_t image_base, uint32_t image_size) {
+  auto* disp = WamFunctionDispatcher::instance();
+  if (!disp) return false;
+  rex::PPCImageInfo info;
+  info.code_base = code_base;
+  info.code_size = code_size;
+  info.image_base = image_base;
+  info.image_size = image_size;
+  info.func_mappings = PPCFuncMappings;
+  return disp->InitFromImage(info);
+}
+bool Memory::DestroyFunctionTable(uint32_t code_base) { return true; }
+bool Memory::SetFunction(uint32_t guest_address, PPCFunc* host_function) {
+  if (host_function) g_wasm_func_map[guest_address] = host_function;
+  return true;
+}
+bool Memory::HasAnyFunctionTable() const { return !g_wasm_func_map.empty(); }
+
+void* Memory::RegisterPhysicalMemoryInvalidationCallback(
+    PhysicalMemoryInvalidationCallback callback, void* callback_context) { return nullptr; }
+void Memory::UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle) {}
+void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
+                                                  bool enable_invalidation_notifications,
+                                                  bool enable_data_providers) {}
+bool Memory::TriggerPhysicalMemoryCallbacks(
+    std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+    uint32_t virtual_address, uint32_t length, bool is_write,
+    bool unwatch_exact_range, bool unprotect) { return false; }
+
+}  // namespace rex::memory
+
+// ============================================================================
+// SDK core library stubs
+// ============================================================================
+
+namespace rex {
+
+uint8_t lzcnt(uint32_t value) {
+  if (value == 0) return 32;
+  return (uint8_t)__builtin_clz(value);
+}
+
+}  // namespace rex
+
+namespace rex::stream {
+
+ByteStream::ByteStream(uint8_t* data, size_t data_length, size_t offset)
+    : data_(data), data_length_(data_length), offset_(offset) {}
+ByteStream::~ByteStream() = default;
+void ByteStream::Read(std::span<uint8_t> buffer) {
+  std::memset(buffer.data(), 0, buffer.size());
+}
+void ByteStream::Write(std::span<const uint8_t> buffer) {}
+
+}  // namespace rex::stream
+
+namespace rex::string {
+
+bool utf8_equal_case(std::string_view a, std::string_view b) { return a == b; }
+
+}  // namespace rex::string
+
+namespace rex::kernel::xboxkrnl {
+
+void xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool proc) {}
+void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, uint32_t proc, bool yield) {}
+
+}  // namespace rex::kernel::xboxkrnl
+
+namespace rex::filesystem {
+
+// Device base class
+Device::Device(std::string_view mount_path) : mount_path_(mount_path) {}
+Device::~Device() = default;
+
+// Entry base class
+Entry::Entry(Device* device, Entry* parent, const std::string_view path)
+    : device_(device), parent_(parent), path_(path) {
+  // Extract the name (last component) from the path
+  auto sep = path.rfind('\\');
+  if (sep == std::string_view::npos) sep = path.rfind('/');
+  if (sep != std::string_view::npos)
+    name_ = std::string(path.substr(sep + 1));
+  else
+    name_ = std::string(path);
+}
+Entry::~Entry() = default;
+
+VirtualFileSystem::VirtualFileSystem() = default;
+VirtualFileSystem::~VirtualFileSystem() = default;
+bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device) { return true; }
+Entry* VirtualFileSystem::ResolvePath(std::string_view path) { return nullptr; }
+bool VirtualFileSystem::RegisterSymbolicLink(std::string_view path,
+                                              std::string_view target) { return true; }
+
+NullDevice::NullDevice(const std::string& mount_path,
+                        const std::initializer_list<std::string>& null_paths)
+    : Device(mount_path) {}
+NullDevice::~NullDevice() = default;
+
+HostPathDevice::HostPathDevice(const std::string_view mount_path,
+                                const std::filesystem::path& host_path,
+                                bool read_only) : Device(mount_path) {}
+HostPathDevice::~HostPathDevice() = default;
+
+}  // namespace rex::filesystem
+
+// ============================================================================
+// VFS bridge — file operations for kernel stubs
+// ============================================================================
+
+// Embedded test manifest for when the server-side manifest isn't available
+static const char kTestManifest[] = R"({
+  "files": {
+    "fe\\ion\\mainmenu.bin": {"o": 0, "s": 16384, "us": 16384, "c": "none"},
+    "rendering\\player\\texlib_0.rx2": {"o": 16384, "s": 2048, "us": 2048, "c": "none"},
+    "audio\\boot\\audio_boot.bnk": {"o": 18432, "s": 4096, "us": 4096, "c": "none"},
+    "data\\boot\\boot.big": {"o": 22528, "s": 4096, "us": 4096, "c": "none"}
+  }
+})";
+
+#ifdef __EMSCRIPTEN__
+
+static nhllegacy::HttpRangeDevice* g_wasm_vfs_device = nullptr;
+static rex::filesystem::File* g_wasm_file_table[kWasmMaxFileHandles] = {};
+static bool g_wasm_vfs_initialized = false;
+
+bool InitWasmVfs() {
+  if (g_wasm_vfs_initialized) return true;
+
+  // Load manifest — prefer embedded test manifest (works everywhere),
+  // fall back to server fetch in browser.
+  nhllegacy::Manifest manifest;
+  if (!nhllegacy::HttpRangeDevice::LoadManifestFromString(kTestManifest, manifest)) {
+    if (!nhllegacy::HttpRangeDevice::LoadManifestFromUrl("/data/nhllegacy.manifest.json",
+                                                          manifest)) {
+      std::fprintf(stderr, "[vfs] WARNING: no manifest available, files won't serve\n");
+      g_wasm_vfs_initialized = true;
+      return false;
+    }
+  }
+
+  size_t manifest_count = manifest.size();
+  g_wasm_vfs_device = new nhllegacy::HttpRangeDevice(
+      "\\CACHE", "/data/nhllegacy.bundle", std::move(manifest), "/opfs/cache");
+
+  if (!g_wasm_vfs_device->Initialize()) {
+    std::fprintf(stderr, "[vfs] ERROR: HttpRangeDevice init failed\n");
+    return false;
+  }
+
+  g_wasm_vfs_initialized = true;
+  std::fprintf(stderr, "[vfs] HttpRangeDevice ready (%zu manifest entries)\n",
+               manifest_count);
+  return true;
+}
+
+#else  // !__EMSCRIPTEN__
+
+bool InitWasmVfs() {
+  // Node.js test: no real assets
+  return false;
+}
+
+#endif
+
+// File handle table (works in both environments)
+static rex::filesystem::File* s_file_table[kWasmMaxFileHandles] = {};
+static uint32_t s_next_handle = 1;
+
+uint32_t WasmOpenFile(const char* guest_path, uint32_t& out_status) {
+#ifdef __EMSCRIPTEN__
+  if (!g_wasm_vfs_device) {
+    out_status = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+    return 0;
+  }
+
+  // Resolve path through HttpRangeDevice
+  auto* entry = g_wasm_vfs_device->ResolvePath(guest_path);
+  if (!entry) {
+    out_status = 0xC0000034u;
+    return 0;
+  }
+
+  rex::filesystem::File* file = nullptr;
+  rex::X_STATUS st = entry->Open(1u, &file);  // FILE_READ_DATA
+  if (st != 0 || !file) {
+    out_status = 0xC0000043u; // STATUS_FILE_INVALID
+    return 0;
+  }
+
+  // Find a free handle slot
+  for (uint32_t i = 0; i < kWasmMaxFileHandles; ++i) {
+    uint32_t h = (s_next_handle + i) % kWasmMaxFileHandles;
+    if (h == 0) continue;
+    if (s_file_table[h] == nullptr) {
+      s_file_table[h] = file;
+      s_next_handle = h + 1;
+      out_status = 0; // STATUS_SUCCESS
+      return h;
+    }
+  }
+
+  delete file;
+  out_status = 0xC000009Au; // STATUS_INSUFFICIENT_RESOURCES
+  return 0;
+#else
+  (void)guest_path;
+  out_status = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+  return 0;
+#endif
+}
+
+uint32_t WasmReadFile(uint32_t handle, void* buffer, uint32_t size) {
+  if (handle == 0 || handle >= kWasmMaxFileHandles) return 0;
+  auto* file = s_file_table[handle];
+  if (!file) return 0;
+
+  size_t bytes_read = 0;
+  rex::X_STATUS st = file->ReadSync(
+      std::span<uint8_t>(static_cast<uint8_t*>(buffer), size), 0, &bytes_read);
+  if (st != 0) return 0;
+  return static_cast<uint32_t>(bytes_read);
+}
+
+void WasmCloseFile(uint32_t handle) {
+  if (handle == 0 || handle >= kWasmMaxFileHandles) return;
+  if (s_file_table[handle]) {
+    delete s_file_table[handle];
+    s_file_table[handle] = nullptr;
+  }
+}
+
+// ============================================================================
 // PPCImageConfig — guest image layout (referenced by generated recomp).
 // ============================================================================
 
@@ -338,6 +725,9 @@ extern "C" int wasm_boot_guest() {
 
   wasm_guest_base();
   uint8_t* base = g_guest_base;
+
+  // Initialize the VFS bridge (manifest + HttpRangeDevice)
+  InitWasmVfs();
 
   auto* disp = new WamFunctionDispatcher();
   WamFunctionDispatcher::set_instance(disp);
@@ -450,7 +840,7 @@ extern "C" int wasm_boot_guest() {
     0x827FE0F8,  // MmAllocatePhysicalMemoryEx caller
     0x836FB1E8,  // RtlImageXexHeaderField caller
     0x83069640,  // MmAllocatePhysicalMemoryEx caller
-    // 0x83095C48,  // XMA context creation loop — SKIP to avoid infinite loop
+    // 0x83095C48,  // XMA context creation loop — SKIP: infinite even after XMACreateContext fix
     0x836EF540,  // TU 160 function
     // 0x836EF5A8,  // TU 160 function — SKIP (OOB crash)
     0x836EF650,  // TU 160 function

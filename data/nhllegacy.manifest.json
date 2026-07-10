@@ -1,0 +1,34 @@
+[
+  {
+    "path": "audio\\boot\\audio_boot.bnk",
+    "offset": 0,
+    "size": 4096,
+    "uncompressed_size": 4096,
+    "compression": "none",
+    "sha256": "ad7facb2586fc6e966c004d7d1d16b024f5805ff7cb47c7a85dabd8b48892ca7"
+  },
+  {
+    "path": "data\\boot\\boot.big",
+    "offset": 4096,
+    "size": 4096,
+    "uncompressed_size": 4096,
+    "compression": "none",
+    "sha256": "ad7facb2586fc6e966c004d7d1d16b024f5805ff7cb47c7a85dabd8b48892ca7"
+  },
+  {
+    "path": "fe\\ion\\mainmenu.bin",
+    "offset": 8192,
+    "size": 16384,
+    "uncompressed_size": 16384,
+    "compression": "none",
+    "sha256": "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+  },
+  {
+    "path": "rendering\\player\\texlib_0.rx2",
+    "offset": 24576,
+    "size": 2048,
+    "uncompressed_size": 2048,
+    "compression": "none",
+    "sha256": "e5a00aa9991ac8a5ee3109844d84a55583bd20572ad3ffcd42792f3c36b183ad"
+  }
+]

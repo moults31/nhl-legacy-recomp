@@ -30,9 +30,10 @@ set(NHL_WASM_INCLUDES
 file(GLOB GENERATED_SOURCES "${GENERATED_DIR}/*.cpp")
 add_library(nhllegacy_recomp STATIC ${GENERATED_SOURCES})
 target_include_directories(nhllegacy_recomp PRIVATE ${NHL_WASM_INCLUDES})
-target_compile_options(nhllegacy_recomp PRIVATE -Os -pthread -sWASM_BIGINT -Wno-deprecated-pragma)
+target_compile_options(nhllegacy_recomp PRIVATE -O1 -pthread -Wno-deprecated-pragma)
 
 # ----- executable -----
+set(SDK_SYSTEM_SRC "${SDK_DIR}/src/system")
 set(WASM_SOURCES
   ${WASM_SRC}/runtime_stubs.cpp
   ${WASM_SRC}/kernel_stubs.cpp
@@ -40,6 +41,24 @@ set(WASM_SOURCES
   ${WASM_SRC}/windowed_app_context_html5.cpp
   ${WASM_SRC}/webgpu_graphics_system.cpp
   ${WASM_SRC}/webgpu_command_processor.cpp
+  ${SRC_DIR}/http_range_device.cpp
+  # P2a: core kernel runtime — compile cleanly under Emscripten
+  ${SDK_SYSTEM_SRC}/thread.cpp
+  ${SDK_SYSTEM_SRC}/module.cpp
+  ${SDK_SYSTEM_SRC}/xmodule.cpp
+  ${SDK_SYSTEM_SRC}/kernel_module.cpp
+  ${SDK_SYSTEM_SRC}/xobject.cpp
+  ${SDK_SYSTEM_SRC}/kernel_state.cpp
+  # P2c: remaining SDK system files (function_dispatcher excluded — its
+  # ResolveIndirectFunction conflicts with our WASM implementation, and its
+  # GetBoundFunctionDispatcher needs Runtime::Setup which isn't ready yet)
+  ${SDK_SYSTEM_SRC}/export_resolver.cpp
+  ${SDK_SYSTEM_SRC}/xevent.cpp
+  ${SDK_SYSTEM_SRC}/xsemaphore.cpp
+  ${SDK_SYSTEM_SRC}/xmutant.cpp
+  ${SDK_SYSTEM_SRC}/xfile.cpp
+  ${SDK_SYSTEM_SRC}/xthread.cpp
+  ${SDK_SYSTEM_SRC}/runtime.cpp
 )
 
 add_executable(nhllegacy ${WASM_SOURCES})
@@ -54,7 +73,7 @@ target_compile_options(nhllegacy PRIVATE -Wno-deprecated-pragma)
 target_link_libraries(nhllegacy PRIVATE nhllegacy_recomp)
 
 target_link_options(nhllegacy PRIVATE
-  -Os
+  -O1
   -g0
   -sWASM_BIGINT
   -sALLOW_MEMORY_GROWTH=1

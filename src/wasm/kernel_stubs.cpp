@@ -8,6 +8,7 @@
 
 #include <rex/ppc.h>
 #include <emscripten.h>
+#include "vfs_bridge.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -631,6 +632,8 @@ __attribute__((weak, noinline)) void __imp__NtClearEvent(PPCContext& ctx, uint8_
 __attribute__((weak, noinline)) void __imp__NtClose(PPCContext& ctx, uint8_t* base) {
   (void)base;
   STUB_LOG("__imp__NtClose");
+  uint32_t handle = (uint32_t)ctx.r3.u32;
+  WasmCloseFile(handle);
   ctx.r3.u64 = 0u;
 }
 __attribute__((weak, noinline)) void __imp__NtCreateEvent(PPCContext& ctx, uint8_t* base) {
@@ -639,8 +642,49 @@ __attribute__((weak, noinline)) void __imp__NtCreateEvent(PPCContext& ctx, uint8
   ctx.r3.u64 = 0u;
 }
 __attribute__((weak, noinline)) void __imp__NtCreateFile(PPCContext& ctx, uint8_t* base) {
-  (void)base;
   STUB_LOG("__imp__NtCreateFile");
+  // r3 = PHANDLE (output handle ptr in guest mem), r5 = OBJECT_ATTRIBUTES ptr
+  uint32_t handle_ptr = ctx.r3.u32;
+  uint32_t obj_attr = ctx.r5.u32;
+
+  if (obj_attr >= 0x1000) {
+    // Read ObjectName (PUNICODE_STRING) from ObjectAttributes+8
+    uint32_t unicode_ptr = __builtin_bswap32(*(volatile uint32_t*)(base + obj_attr + 8));
+    if (unicode_ptr >= 0x1000) {
+      // Read Buffer pointer from UNICODE_STRING+4
+      uint32_t buf_ptr = __builtin_bswap32(*(volatile uint32_t*)(base + unicode_ptr + 4));
+      // Read Length (byte count, not including null) from UNICODE_STRING+0
+      uint16_t str_len = __builtin_bswap16(*(volatile uint16_t*)(base + unicode_ptr));
+
+      if (buf_ptr >= 0x1000 && str_len > 0 && str_len < 1024) {
+        // Convert wide string to narrow (ASCII approximation for paths)
+        char path[1024];
+        int plen = 0;
+        for (uint16_t i = 0; i + 1 < str_len && i < sizeof(path) - 1; i += 2) {
+          uint16_t wc = __builtin_bswap16(*(volatile uint16_t*)(base + buf_ptr + i));
+          if (wc < 128) path[plen++] = (char)wc;
+        }
+        path[plen] = '\0';
+
+        // Strip device prefix if present
+        const char* file_path = path;
+        const char* dev_prefix = "\\Device\\Harddisk0\\Partition1";
+        if (strncmp(path, dev_prefix, strlen(dev_prefix)) == 0) {
+          file_path = path + strlen(dev_prefix);
+          while (*file_path == '\\') ++file_path;
+        }
+
+        uint32_t status;
+        uint32_t handle = WasmOpenFile(file_path, status);
+        if (handle && handle_ptr >= 0x1000) {
+          *(volatile uint32_t*)(base + handle_ptr) = __builtin_bswap32(handle);
+        }
+        ctx.r3.u64 = status;
+        return;
+      }
+    }
+  }
+
   ctx.r3.u64 = 0u;
 }
 __attribute__((weak, noinline)) void __imp__NtCreateMutant(PPCContext& ctx, uint8_t* base) {
@@ -679,8 +723,44 @@ __attribute__((weak, noinline)) void __imp__NtFreeVirtualMemory(PPCContext& ctx,
   ctx.r3.u64 = 0u;
 }
 __attribute__((weak, noinline)) void __imp__NtOpenFile(PPCContext& ctx, uint8_t* base) {
-  (void)base;
   STUB_LOG("__imp__NtOpenFile");
+  // r3 = PHANDLE (output), r5 = OBJECT_ATTRIBUTES ptr
+  uint32_t handle_ptr = ctx.r3.u32;
+  uint32_t obj_attr = ctx.r5.u32;
+
+  if (obj_attr >= 0x1000) {
+    uint32_t unicode_ptr = __builtin_bswap32(*(volatile uint32_t*)(base + obj_attr + 8));
+    if (unicode_ptr >= 0x1000) {
+      uint32_t buf_ptr = __builtin_bswap32(*(volatile uint32_t*)(base + unicode_ptr + 4));
+      uint16_t str_len = __builtin_bswap16(*(volatile uint16_t*)(base + unicode_ptr));
+
+      if (buf_ptr >= 0x1000 && str_len > 0 && str_len < 1024) {
+        char path[1024];
+        int plen = 0;
+        for (uint16_t i = 0; i + 1 < str_len && i < sizeof(path) - 1; i += 2) {
+          uint16_t wc = __builtin_bswap16(*(volatile uint16_t*)(base + buf_ptr + i));
+          if (wc < 128) path[plen++] = (char)wc;
+        }
+        path[plen] = '\0';
+
+        const char* file_path = path;
+        const char* dev_prefix = "\\Device\\Harddisk0\\Partition1";
+        if (strncmp(path, dev_prefix, strlen(dev_prefix)) == 0) {
+          file_path = path + strlen(dev_prefix);
+          while (*file_path == '\\') ++file_path;
+        }
+
+        uint32_t status;
+        uint32_t handle = WasmOpenFile(file_path, status);
+        if (handle && handle_ptr >= 0x1000) {
+          *(volatile uint32_t*)(base + handle_ptr) = __builtin_bswap32(handle);
+        }
+        ctx.r3.u64 = status;
+        return;
+      }
+    }
+  }
+
   ctx.r3.u64 = 0xC0000034u;
 }
 __attribute__((weak, noinline)) void __imp__NtQueryDirectoryFile(PPCContext& ctx, uint8_t* base) {
@@ -709,8 +789,26 @@ __attribute__((weak, noinline)) void __imp__NtQueryVolumeInformationFile(PPCCont
   ctx.r3.u64 = 0u;
 }
 __attribute__((weak, noinline)) void __imp__NtReadFile(PPCContext& ctx, uint8_t* base) {
-  (void)base;
   STUB_LOG("__imp__NtReadFile");
+  // r3 = FileHandle, r8 = Buffer (guest addr), r9 = Length, r7 = IoStatusBlock
+  uint32_t handle = ctx.r3.u32;
+  uint32_t buf_addr = ctx.r8.u32;
+  uint32_t length = ctx.r9.u32;
+
+  if (handle && buf_addr >= 0x1000 && length > 0) {
+    uint32_t bytes_read = WasmReadFile(handle, base + buf_addr, length);
+    // Write bytes_read to IoStatusBlock+0 (or just return success)
+    ctx.r3.u64 = 0u;  // STATUS_SUCCESS
+
+    // If IoStatusBlock is provided, write the info
+    uint32_t iosb = ctx.r7.u32;
+    if (iosb >= 0x1000) {
+      *(volatile uint32_t*)(base + iosb) = 0;                          // Status
+      *(volatile uint32_t*)(base + iosb + 4) = __builtin_bswap32(bytes_read);  // Information
+    }
+    return;
+  }
+
   ctx.r3.u64 = 0u;
 }
 __attribute__((weak, noinline)) void __imp__NtReadFileScatter(PPCContext& ctx, uint8_t* base) {
@@ -1498,10 +1596,11 @@ __attribute__((weak, noinline)) void __imp__XGetVideoMode(PPCContext& ctx, uint8
   STUB_LOG("__imp__XGetVideoMode");
   ctx.r3.u64 = 0u;
 }
+static std::atomic<unsigned> xma_context_id{1};
 __attribute__((weak, noinline)) void __imp__XMACreateContext(PPCContext& ctx, uint8_t* base) {
   (void)base;
   STUB_LOG("__imp__XMACreateContext");
-  ctx.r3.u64 = 0u;
+  ctx.r3.u64 = xma_context_id.fetch_add(1, std::memory_order_relaxed);
 }
 __attribute__((weak, noinline)) void __imp__XMADisableContext(PPCContext& ctx, uint8_t* base) {
   (void)base;

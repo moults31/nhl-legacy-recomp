@@ -37,8 +37,16 @@
 
 #ifdef __EMSCRIPTEN__
 
-// Emscripten ships zlib; we use it for raw deflate.
+// Emscripten provides zlib via -lz; the header may not be on the default
+// include path in all toolchain versions. We guard it and provide a runtime
+// fallback so the build doesn't break.
+#if __has_include(<zlib.h>)
 #include <zlib.h>
+#else
+// zlib not available at compile time — deflate decompression disabled.
+// LZX-only bundles will still work (zlib-free path below).
+#define NO_ZLIB
+#endif
 
 namespace nhllegacy {
 namespace lzx {
@@ -444,6 +452,7 @@ inline std::vector<uint8_t> DecompressDeflate(const std::vector<uint8_t>& input,
                                               size_t expected_uncompressed_size) {
     std::vector<uint8_t> output(expected_uncompressed_size);
 
+#ifndef NO_ZLIB
     z_stream stream{};
     stream.next_in   = const_cast<Bytef*>(input.data());
     stream.avail_in  = static_cast<uInt>(input.size());
@@ -461,8 +470,14 @@ inline std::vector<uint8_t> DecompressDeflate(const std::vector<uint8_t>& input,
     if (rc != Z_STREAM_END)
         throw std::runtime_error("deflate: inflate failed (rc=" +
                                  std::to_string(rc) + ")");
-
+#else
+    (void)input;
+    (void)expected_uncompressed_size;
+    throw std::runtime_error("deflate: not available (zlib not found)");
+#endif
+#ifndef NO_ZLIB
     output.resize(stream.total_out);
+#endif
     return output;
 }
 
