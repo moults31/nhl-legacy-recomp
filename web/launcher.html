@@ -128,15 +128,24 @@
 
       log('[gpu] gpu object OK, requesting adapter...', 'info');
 
-      // Race against a 10-second timeout to detect silent hangs
+      // Race against a 3-second timeout with independent probes
+      var start = Date.now();
+      var race = Promise.race([
+        navigator.gpu.requestAdapter({powerPreference: 'high-performance'}),
+        new Promise(function(resolve, reject) {
+          setTimeout(function() { reject(new Error('timeout 3s')); }, 3000);
+        })
+      ]);
+      race.then(function(a) {
+        log('[gpu] resolved after ' + (Date.now() - start) + 'ms', 'info');
+      });
+      race.catch(function(e) {
+        log('[gpu] rejected after ' + (Date.now() - start) + 'ms: ' + e.message, 'err');
+      });
+
       var adapter = null;
       try {
-        adapter = await Promise.race([
-          navigator.gpu.requestAdapter({powerPreference: 'high-performance'}),
-          new Promise(function(_, reject) {
-            setTimeout(function() { reject(new Error('adapter request timed out after 10s')); }, 10000);
-          })
-        ]);
+        adapter = await race;
       } catch (e) {
         log('[gpu] adapter request FAILED: ' + (e.message || String(e)), 'err');
         return null;
