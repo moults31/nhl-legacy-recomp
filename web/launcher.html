@@ -126,28 +126,21 @@
         return null;
       }
 
-      log('[gpu] gpu object OK, requesting adapter...', 'info');
+      log('[gpu] gpu object OK, testing adapter...', 'info');
 
-      // Race against a 3-second timeout with independent probes
+      // Simple timer to verify the event loop is alive
       var start = Date.now();
-      var race = Promise.race([
-        navigator.gpu.requestAdapter({powerPreference: 'high-performance'}),
-        new Promise(function(resolve, reject) {
-          setTimeout(function() { reject(new Error('timeout 3s')); }, 3000);
-        })
-      ]);
-      race.then(function(a) {
-        log('[gpu] resolved after ' + (Date.now() - start) + 'ms', 'info');
-      });
-      race.catch(function(e) {
-        log('[gpu] rejected after ' + (Date.now() - start) + 'ms: ' + e.message, 'err');
-      });
+      setTimeout(function() {
+        console.warn('[gpu] still waiting after ' + (Date.now() - start) + 'ms');
+      }, 3000);
 
+      // Try without powerPreference first (some Chrome versions hang with it)
       var adapter = null;
       try {
-        adapter = await race;
+        adapter = await navigator.gpu.requestAdapter();
+        log('[gpu] adapter ' + (Date.now() - start) + 'ms: ' + (adapter ? adapter.name : 'null'), 'info');
       } catch (e) {
-        log('[gpu] adapter request FAILED: ' + (e.message || String(e)), 'err');
+        log('[gpu] adapter failed: ' + (e.message || String(e)), 'err');
         return null;
       }
 
