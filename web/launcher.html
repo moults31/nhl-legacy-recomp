@@ -79,13 +79,15 @@
           statusEl.textContent = 'Compiling WASM...';
           log('[wasm] Compiling...', 'info');
           WebAssembly.instantiate(new Uint8Array(xhr.response), info)
-            .then(function(result) {
+             .then(function(result) {
               statusEl.textContent = 'Instantiating WASM...';
               log('[wasm] Instantiating...', 'info');
               log('[wasm] Running main()...', 'info');
               receiveInstance(result.instance, result.module);
               log('[wasm] main() returned', 'info');
               statusEl.textContent = 'WASM instantiated — main() finished';
+              // GPU init on macrotask (event loop available, not inside microtask)
+              setTimeout(function() { initWebGpu(Module.canvas); }, 0);
             })
             .catch(function(err) {
               var msg = err.message || String(err);
@@ -109,14 +111,10 @@
       }
     };
 
-    // Hook into Module.postRun to init WebGPU after main() finishes
-    Module.postRun = [];
-
     statusEl.textContent = 'Waiting for WASM module...';
 
-    // WebGPU init — runs after WASM runtime is ready, with event loop yield
+    // WebGPU init — runs after WASM runtime is ready (called via setTimeout)
     async function initWebGpu(canvas) {
-      await new Promise(r => setTimeout(r, 0)); // yield to event loop
       if (!navigator.gpu) {
         log('[gpu] WebGPU not available', 'warn');
         return null;
