@@ -125,11 +125,26 @@
         log('[gpu] Then check chrome://gpu for WebGPU status', 'warn');
         return null;
       }
-      log('[gpu] Requesting adapter...', 'info');
-      const adapter = await navigator.gpu.requestAdapter();
+
+      log('[gpu] gpu object OK, requesting adapter...', 'info');
+
+      // Race against a 10-second timeout to detect silent hangs
+      var adapter = null;
+      try {
+        adapter = await Promise.race([
+          navigator.gpu.requestAdapter({powerPreference: 'high-performance'}),
+          new Promise(function(_, reject) {
+            setTimeout(function() { reject(new Error('adapter request timed out after 10s')); }, 10000);
+          })
+        ]);
+      } catch (e) {
+        log('[gpu] adapter request FAILED: ' + (e.message || String(e)), 'err');
+        return null;
+      }
+
       if (!adapter) { log('[gpu] No adapter found', 'warn'); return null; }
       log('[gpu] Adapter: ' + adapter.name, 'info');
-      const device = await adapter.requestDevice();
+      var device = await adapter.requestDevice();
       log('[gpu] Device acquired', 'info');
       
       const context = canvas.getContext('webgpu');
