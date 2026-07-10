@@ -41,6 +41,7 @@
 #include <rex/filesystem/devices/null_device.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/system/xmemory.h>
+#include <rex/system/xnotifylistener.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/runtime.h>
 #include "vfs_bridge.h"
@@ -322,10 +323,144 @@ namespace rex {
 void initialize_seh() {}
 }  // namespace rex
 
+// ---- FatalError ------------------------------------------------------------
 
-// ============================================================================
-// SDK Memory stubs — WASM-compatible replacements for mmap-backed Memory.
-// ============================================================================
+namespace rex {
+void FatalError(std::string_view msg) { std::abort(); }
+}  // namespace rex
+
+// ---- ThreadState (single-threaded WASM) ------------------------------------
+
+namespace rex::runtime {
+thread_local ThreadState* tls_thread_state = nullptr;
+void ThreadState::Bind(ThreadState* thread_state) { tls_thread_state = thread_state; }
+ThreadState* ThreadState::Get() { return tls_thread_state; }
+}  // namespace rex::runtime
+
+// ---- ContentManager stub (no real filesystem on WASM) -----------------------
+
+namespace rex::system::xam {
+ContentManager::ContentManager(KernelState*, const std::filesystem::path&) {}
+ContentManager::~ContentManager() = default;
+}  // namespace rex::system::xam
+
+// ---- ObjectTable + NativeList stubs ---------------------------------------
+
+namespace rex::system::util {
+
+static std::unordered_map<X_HANDLE, XObject*> g_object_table;
+
+ObjectTable::ObjectTable() = default;
+ObjectTable::~ObjectTable() = default;
+void ObjectTable::Reset() { g_object_table.clear(); }
+X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
+  thread_local X_HANDLE next_handle = 1;
+  if (out_handle) { *out_handle = next_handle++; g_object_table[*out_handle] = object; }
+  return 0;
+}
+X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) { g_object_table.erase(handle); return 0; }
+X_STATUS ObjectTable::RetainHandle(X_HANDLE) { return 0; }
+X_STATUS ObjectTable::ReleaseHandle(X_HANDLE) { return 0; }
+X_STATUS ObjectTable::DuplicateHandle(X_HANDLE, X_HANDLE*) { return 0; }
+bool ObjectTable::Save(stream::ByteStream*) { return true; }
+bool ObjectTable::Restore(stream::ByteStream*) { return true; }
+X_STATUS ObjectTable::RestoreHandle(X_HANDLE, XObject*) { return 0; }
+void ObjectTable::GetObjectsByType(XObject::Type,
+                                    std::vector<object_ref<XObject>>*) {}
+
+NativeList::NativeList() = default;
+NativeList::NativeList(memory::Memory*) {}
+
+}  // namespace rex::system::util
+
+// ---- XNotifyListener stub --------------------------------------------------
+
+namespace rex::system {
+XNotifyListener::XNotifyListener(KernelState* kernel_state)
+    : XObject(kernel_state, XObject::Type::NotifyListener) {}
+XNotifyListener::~XNotifyListener() = default;
+void XNotifyListener::EnqueueNotification(uint32_t id, uint32_t data) { (void)id; (void)data; }
+}  // namespace rex::system
+
+// ---- NormalizeGuestPath ------------------------------------------------
+
+namespace rex::system {
+std::string NormalizeGuestPath(std::string_view path) { return std::string(path); }
+}  // namespace rex::system
+
+// ---- UserProfile stub ---------------------------------------------------
+
+namespace rex::system::xam {
+UserProfile::UserProfile() = default;
+}  // namespace rex::system::xam
+
+// ---- FunctionDispatcher stub ------------------------------------------------
+// We provide FunctionDispatcher outside the SDK's function_dispatcher.cpp
+// to avoid a duplicate ResolveIndirectFunction symbol.
+
+namespace rex::runtime {
+
+FunctionDispatcher::FunctionDispatcher(memory::Memory* memory, ExportResolver* export_resolver)
+    : memory_(memory), export_resolver_(export_resolver) {}
+FunctionDispatcher::~FunctionDispatcher() = default;
+
+bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t code_size,
+                                                  uint32_t image_base, uint32_t image_size,
+                                                  bool is_entrypoint) {
+  if (is_entrypoint) entrypoint_code_base_ = code_base;
+  return memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size);
+}
+
+bool FunctionDispatcher::SetFunction(uint32_t guest_address, ::PPCFunc* func) {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  function_table_[guest_address] = func;
+  memory_->SetFunction(guest_address, func);
+  return true;
+}
+
+::PPCFunc* FunctionDispatcher::GetFunction(uint32_t guest_address) {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  auto it = function_table_.find(guest_address);
+  return it != function_table_.end() ? it->second : nullptr;
+}
+
+uint32_t FunctionDispatcher::AllocateThunk(::PPCFunc* func, uint32_t caller_address) {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  auto* mod = FindModuleByAddress(caller_address);
+  if (!mod && entrypoint_code_base_) mod = FindModuleByAddress(entrypoint_code_base_);
+  if (!mod) return 0;
+  if (mod->next_thunk_address >= mod->thunk_limit) return 0;
+  uint32_t addr = mod->next_thunk_address;
+  mod->next_thunk_address += 4;
+  SetFunction(addr, func);
+  return addr;
+}
+
+uint32_t FunctionDispatcher::FindCallerModuleBase(uint32_t guest_address) {
+  auto* mod = FindModuleByAddress(guest_address);
+  return mod ? mod->code_base : 0;
+}
+
+void FunctionDispatcher::RegisterModule(const std::string& module_id, uint32_t code_base,
+                                         RegisterFn register_func) {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  module_addresses_[module_id] = {code_base, {}};
+  recording_ = true;
+  recording_addresses_.clear();
+  register_func(this);
+  recording_ = false;
+  module_addresses_[module_id].addresses = std::move(recording_addresses_);
+}
+
+FunctionDispatcher::ModuleTableInfo* FunctionDispatcher::FindModuleByAddress(uint32_t addr) {
+  for (auto& mt : module_tables_) {
+    auto end = mt.code_base + mt.code_size + kThunkReserveSize;
+    if (addr >= mt.code_base && addr < end) return &mt;
+  }
+  return nullptr;
+}
+
+}  // namespace rex::runtime
 
 static std::unordered_map<uint32_t, PPCFunc*> g_wasm_func_map;
 
@@ -729,7 +864,26 @@ extern "C" int wasm_boot_guest() {
   // Initialize the VFS bridge (manifest + HttpRangeDevice)
   InitWasmVfs();
 
+  // Create the WASM function dispatcher and populate all 129,934 functions
   auto* disp = new WamFunctionDispatcher();
+  WamFunctionDispatcher::set_instance(disp);
+  if (!disp->InitFromImage(PPCImageConfig)) {
+    std::fprintf(stderr, "[sdk] FATAL: InitFromImage failed\n");
+    return 1;
+  }
+
+  // Initialize SDK Runtime. This creates Memory, ExportResolver,
+  // FunctionDispatcher, and KernelState, sets Runtime::instance_,
+  // and runs the SDK's SetFunction loop to populate its own
+  // function_table_ (in addition to our WamFunctionDispatcher tables).
+  static rex::Runtime s_runtime("", "", "", "");
+  rex::X_STATUS status = s_runtime.Setup(PPCImageConfig);
+  if (status == 0) {
+    std::fprintf(stderr, "[sdk] WASM Runtime setup successful\n");
+  } else {
+    std::fprintf(stderr, "[sdk] WASM Runtime setup returned 0x%08X\n",
+                 static_cast<uint32_t>(status));
+  }
   WamFunctionDispatcher::set_instance(disp);
 
   if (!disp->InitFromImage(PPCImageConfig)) {
