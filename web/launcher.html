@@ -87,11 +87,7 @@
               log('[wasm] main() returned', 'info');
               statusEl.textContent = 'WASM instantiated — main() finished';
               // GPU init on macrotask (event loop available, not inside microtask)
-              setTimeout(function() {
-                initWebGpu(Module.canvas).catch(function(e) {
-                  log('[gpu] ERROR: ' + (e.message || String(e)), 'err');
-                });
-              }, 0);
+              setTimeout(function() { initCanvas(Module.canvas); }, 0);
             })
             .catch(function(err) {
               var msg = err.message || String(err);
@@ -117,67 +113,15 @@
 
     statusEl.textContent = 'Waiting for WASM module...';
 
-    // WebGPU init — runs after WASM runtime is ready (called via setTimeout)
-    async function initWebGpu(canvas) {
-      if (!navigator.gpu) {
-        log('[gpu] navigator.gpu not available — WebGPU disabled', 'warn');
-        log('[gpu] Enable in chrome://flags/#enable-unsafe-webgpu', 'warn');
-        log('[gpu] Then check chrome://gpu for WebGPU status', 'warn');
-        return null;
-      }
-
-      log('[gpu] gpu object OK, testing adapter...', 'info');
-
-      // Simple timer to verify the event loop is alive
-      var start = Date.now();
-      setTimeout(function() {
-        console.warn('[gpu] still waiting after ' + (Date.now() - start) + 'ms');
-      }, 3000);
-
-      // Try without powerPreference first (some Chrome versions hang with it)
-      var adapter = null;
-      try {
-        adapter = await navigator.gpu.requestAdapter();
-        log('[gpu] adapter ' + (Date.now() - start) + 'ms: ' + (adapter ? adapter.name : 'null'), 'info');
-      } catch (e) {
-        log('[gpu] adapter failed: ' + (e.message || String(e)), 'err');
-        return null;
-      }
-
-      if (!adapter) { log('[gpu] No adapter found', 'warn'); return null; }
-      log('[gpu] Adapter: ' + adapter.name, 'info');
-      var device = await adapter.requestDevice();
-      log('[gpu] Device acquired', 'info');
-      
-      const context = canvas.getContext('webgpu');
-      const format = navigator.gpu.getPreferredCanvasFormat();
-      context.configure({
-        device: device,
-        format: format,
-        alphaMode: 'premultiplied',
-      });
-      
-      Module.webgpuDevice = device;
-      Module.webgpuContext = context;
-      Module.canvasFormat = format;
-      
-      log('[gpu] WebGPU initialized ✓', 'info');
-
-      // Render first frame: clear to dark teal
-      const texture = context.getCurrentTexture();
-      const view = texture.createView();
-      const encoder = device.createCommandEncoder();
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view,
-          clearValue: { r: 0.02, g: 0.12, b: 0.16, a: 1.0 },
-          loadOp: 'clear',
-          storeOp: 'store',
-        }],
-      });
-      pass.end();
-      device.queue.submit([encoder.finish()]);
-      log('[gpu] First frame rendered ✓', 'info');
+    // Canvas init — uses 2D context (reliable, no GPU adapter hang)
+    function initCanvas(canvas) {
+      var ctx = canvas.getContext('2d');
+      // Clear to dark teal
+      ctx.fillStyle = '#032029';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      log('[gpu] 2D canvas initialized ✓', 'info');
+      log('[gpu] First frame rendered ✓ (software 2D)', 'info');
+      Module.canvas2d = ctx;
     }
   </script>
   <script src="nhllegacy.js"></script>
