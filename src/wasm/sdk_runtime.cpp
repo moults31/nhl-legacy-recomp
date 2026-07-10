@@ -1106,6 +1106,37 @@ extern "C" int wasm_boot_guest() {
     }
   }
 
+  // Render a test frame: copy guest framebuffer → 2D canvas via EM_ASM
+  {
+    uint32_t fb_ptr = 0x3FE00000;
+    uint32_t w = 1280, h = 720;
+    uint8_t* fb_base = base + fb_ptr;
+
+    // Paint a test pattern
+    for (uint32_t y = 0; y < h; ++y) {
+      for (uint32_t x = 0; x < w; ++x) {
+        uint8_t r, g, b;
+        if (y < 60) { r = 0x05; g = 0x12; b = 0x20; }
+        else if (y < 64) { r = 0xFF; g = 0xFF; b = 0xFF; }
+        else { r = (uint8_t)((x * 255u) / w); g = (uint8_t)((y * 255u) / h); b = 0x30; }
+        size_t off = (size_t)y * (size_t)w * 4u + (size_t)x * 4u;
+        fb_base[off + 0] = b; fb_base[off + 1] = g; fb_base[off + 2] = r; fb_base[off + 3] = 0xFF;
+      }
+    }
+    char js[2048];
+    uint32_t fb_wasm_off = (uint32_t)(uintptr_t)fb_base;
+    snprintf(js, sizeof(js),
+      "setTimeout(function(){"
+      "var p=%u,w=%u,h=%u,ctx=Module.canvas2d;"
+      "if(ctx){var a=new Uint8ClampedArray(HEAPU8.buffer,p,w*h*4);"
+      "for(var i=0;i<a.length;i+=4){var b=a[i],r=a[i+2];a[i]=r;a[i+2]=b;}"
+      "var img=new ImageData(a,w,h);ctx.putImageData(img,0,0);}"
+      "},500);",
+      fb_wasm_off, w, h);
+    emscripten_run_script(js);
+  }
+  std::fprintf(stderr, "[sdk] test frame displayed on canvas\n");
+
   return 0;
 }
 // Auto-generated: 354 data section initializers from nhllegacy_functions.toml

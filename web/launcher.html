@@ -5,7 +5,8 @@
   <title>NHL Legacy — WASM</title>
   <style>
     body { margin: 0; background: #111; color: #0f0; font: 14px monospace; }
-    #log { padding: 10px; white-space: pre-wrap; height: 95vh; overflow-y: auto; }
+    #log { padding: 10px; white-space: pre-wrap; height: 95vh; overflow-y: auto; position: relative; z-index: 2; }
+    #canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; image-rendering: pixelated; }
     .err { color: #f44; }
     .warn { color: #fa0; }
     .info { color: #0af; }

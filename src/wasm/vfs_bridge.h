@@ -8,6 +8,9 @@
 
 #include <cstdint>
 
+// Guest memory base — used by IssueSwap for framebuffer access
+extern uint8_t* wasm_guest_base();
+
 // Maximum number of concurrently open file handles.
 static constexpr uint32_t kWasmMaxFileHandles = 64;
 

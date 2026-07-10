@@ -1,4 +1,4 @@
-// WebGPU command processor — skeleton. No-op pending emdawnwebgpu integration.
+// WebGPU command processor — IssueSwap copies guest framebuffer to 2D canvas.
 
 #include "webgpu_command_processor.h"
 #include "webgpu_graphics_system.h"
@@ -7,8 +7,10 @@
 #include <cstring>
 #include <atomic>
 
+#include <emscripten.h>
 #include <rex/logging.h>
 #include <rex/graphics/xenos.h>
+#include "vfs_bridge.h"
 
 namespace rex::graphics::webgpu {
 
@@ -59,6 +61,16 @@ void WebGpuCommandProcessor::IssueSwap(
     std::fprintf(stderr, "[webgpu] swap #%u: fb=0x%08X %ux%u\n",
                  n + 1, frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   }
+
+  uint8_t* buf = wasm_guest_base() + frontbuffer_ptr;
+  char js[2048];
+  snprintf(js, sizeof(js),
+    "var p=%u,w=%u,h=%u,ctx=Module.canvas2d;"
+    "if(ctx){var a=new Uint8ClampedArray(HEAPU8.buffer,p,w*h*4);"
+    "for(var i=0;i<a.length;i+=4){var b=a[i],r=a[i+2];a[i]=r;a[i+2]=b;}"
+    "var img=new ImageData(a,w,h);ctx.putImageData(img,0,0);}",
+    (unsigned)(uintptr_t)buf, frontbuffer_width, frontbuffer_height);
+  emscripten_run_script(js);
 }
 
 void WebGpuCommandProcessor::TracePlaybackWroteMemory(
