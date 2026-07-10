@@ -964,7 +964,7 @@ extern "C" int wasm_boot_guest() {
     std::fprintf(stderr, "[sdk] 0x%08X → r3=0x%llX (%lld ms)\n",
                  *p, (unsigned long long)pctx.r3.u64, (long long)elapsed);
     std::fflush(stderr);
-    if (elapsed > 5000) {
+    if (elapsed > 15000) {
       std::fprintf(stderr, "[sdk] TIMEOUT — skipping rest\n");
       break;
     }
@@ -1100,7 +1100,7 @@ extern "C" int wasm_boot_guest() {
         std::chrono::steady_clock::now() - start).count();
     std::fprintf(stderr, "[sdk] 0x%08X → r3=0x%llX (%lld ms)\n",
                  *p, (unsigned long long)pctx.r3.u64, (long long)elapsed);
-    if (elapsed > 5000) {
+    if (elapsed > 15000) {
       std::fprintf(stderr, "[sdk] TIMEOUT — skipping rest\n");
       break;
     }

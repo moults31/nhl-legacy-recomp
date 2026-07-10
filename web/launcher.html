@@ -109,10 +109,14 @@
       }
     };
 
+    // Hook into Module.postRun to init WebGPU after main() finishes
+    Module.postRun = [];
+
     statusEl.textContent = 'Waiting for WASM module...';
 
-    // WebGPU init — runs after WASM runtime is ready
+    // WebGPU init — runs after WASM runtime is ready, with event loop yield
     async function initWebGpu(canvas) {
+      await new Promise(r => setTimeout(r, 0)); // yield to event loop
       if (!navigator.gpu) {
         log('[gpu] WebGPU not available', 'warn');
         return null;
@@ -124,25 +128,21 @@
       const device = await adapter.requestDevice();
       log('[gpu] Device acquired', 'info');
       
-      // Configure the canvas
       const context = canvas.getContext('webgpu');
+      const format = navigator.gpu.getPreferredCanvasFormat();
       context.configure({
         device: device,
-        format: navigator.gpu.getPreferredCanvasFormat(),
+        format: format,
         alphaMode: 'premultiplied',
       });
       
-      // Store for WASM access
       Module.webgpuDevice = device;
       Module.webgpuContext = context;
-      Module.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+      Module.canvasFormat = format;
       
       log('[gpu] WebGPU initialized ✓', 'info');
-      return { device, context };
-    }
 
-    // Simple render: clear the canvas to dark teal
-    function clearCanvas(device, context, format) {
+      // Render first frame: clear to dark teal
       const texture = context.getCurrentTexture();
       const view = texture.createView();
       const encoder = device.createCommandEncoder();
@@ -156,20 +156,11 @@
       });
       pass.end();
       device.queue.submit([encoder.finish()]);
+      log('[gpu] First frame rendered ✓', 'info');
     }
 
-    // Hook into existing onRuntimeInitialized
-    const origOnRuntime = Module.onRuntimeInitialized;
-    Module.onRuntimeInitialized = function() {
-      if (origOnRuntime) origOnRuntime();
-      // Init WebGPU and clear canvas once
-      initWebGpu(Module.canvas).then(gpu => {
-        if (gpu) {
-          clearCanvas(gpu.device, gpu.context, Module.canvasFormat);
-          log('[gpu] First frame rendered ✓', 'info');
-        }
-      });
-    };
+    // Schedule WebGPU init as a postRun callback (fires after main() returns)
+    Module.postRun.push(() => { initWebGpu(Module.canvas); });
   </script>
   <script src="nhllegacy.js"></script>
 </body>
