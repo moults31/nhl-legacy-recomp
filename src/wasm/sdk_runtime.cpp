@@ -1116,9 +1116,11 @@ extern "C" int wasm_boot_guest() {
     for (uint32_t y = 0; y < h; ++y) {
       for (uint32_t x = 0; x < w; ++x) {
         uint8_t r, g, b;
-        if (y < 60) { r = 0x05; g = 0x12; b = 0x20; }
-        else if (y < 64) { r = 0xFF; g = 0xFF; b = 0xFF; }
-        else { r = (uint8_t)((x * 255u) / w); g = (uint8_t)((y * 255u) / h); b = 0x30; }
+        if (y < 60) { r = 0x22; g = 0x44; b = 0xAA; }         /* blue header */
+        else if (y < 64) { r = 0xFF; g = 0xFF; b = 0xFF; }      /* white line */
+        else if (y < 100) { r = 0xFF; g = 0x00; b = 0x00; }     /* red band */
+        else if (y < 140) { r = 0x00; g = 0xFF; b = 0x00; }     /* green band */
+        else { r = (uint8_t)((x * 255u) / w); g = (uint8_t)((y * 255u) / h); b = 0x80; } /* gradient */
         size_t off = (size_t)y * (size_t)w * 4u + (size_t)x * 4u;
         fb_base[off + 0] = b; fb_base[off + 1] = g; fb_base[off + 2] = r; fb_base[off + 3] = 0xFF;
       }
