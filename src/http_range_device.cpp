@@ -129,6 +129,7 @@ void OnFetchDone(emscripten_fetch_t* fetch) {
 std::vector<uint8_t> FetchBlocking(const std::string& url,
                                    uint64_t range_start = 0,
                                    uint64_t range_end = 0) {
+    std::fprintf(stderr, "[vfs] FetchBlocking '%s' range=%llu-%llu\n", url.c_str(), range_start, range_end);
     std::vector<uint8_t> result;
     unsigned doRange = (range_end > range_start) ? 1u : 0u;
     unsigned long long rstart = range_start;
@@ -163,6 +164,7 @@ std::vector<uint8_t> FetchBlocking(const std::string& url,
     }, url.c_str(), doRange, rstart, rend);
 
     unsigned fetchLen = EM_ASM_INT({ return Module._fetchLen | 0; });
+    std::fprintf(stderr, "[vfs] FetchBlocking result: %u bytes\n", fetchLen);
     if (fetchLen > 0) {
       void* fetchPtr = reinterpret_cast<void*>(EM_ASM_PTR({ return Module._fetchPtr; }));
       result.assign(static_cast<uint8_t*>(fetchPtr),
