@@ -88,7 +88,7 @@ uint8_t* wasm_guest_base() {
     // Use the heap allocator to reserve space at the top of memory,
     // past the dlmalloc managed region. We align to a 64KB boundary
     // and allocate exactly kGuestMaxOffset bytes.
-    size_t total_needed = kGuestMaxOffset + 64 * 1024 * 1024;
+    size_t total_needed = kGuestMaxOffset + 512 * 1024 * 1024; // buffer + 512MB headroom
     if (emscripten_resize_heap(total_needed)) {
       // After resize, sbrk/brk top is at the old heap limit.
       // Use a manual bump allocator from the top of the heap.
@@ -302,6 +302,10 @@ namespace rex {
 void initialize_seh() {}
 }  // namespace rex
 
+namespace rex::platform {
+bool seh_active() { return false; }
+}  // namespace rex::platform
+
 // ---- FatalError ------------------------------------------------------------
 
 namespace rex {
@@ -312,6 +316,12 @@ void FatalError(std::string_view msg) { std::abort(); }
 
 namespace rex::runtime {
 thread_local ThreadState* tls_thread_state = nullptr;
+ThreadState::ThreadState(uint32_t thread_id, uint32_t, uint32_t, memory::Memory* memory)
+    : memory_(memory), thread_id_(thread_id) {
+  context_ = &context_storage_;
+  std::memset(context_, 0, sizeof(context_storage_));
+}
+ThreadState::~ThreadState() = default;
 void ThreadState::Bind(ThreadState* thread_state) { tls_thread_state = thread_state; }
 ThreadState* ThreadState::Get() { return tls_thread_state; }
 }  // namespace rex::runtime
@@ -452,6 +462,13 @@ void FunctionDispatcher::RegisterModule(const std::string& module_id, uint32_t c
   recording_ = false;
   module_addresses_[module_id].addresses = std::move(recording_addresses_);
 }
+
+std::optional<std::pair<uint32_t, uint32_t>> FunctionDispatcher::UnregisterModule(
+    const std::string& module_id) {
+  return std::nullopt;
+}
+
+uint64_t FunctionDispatcher::Execute(ThreadState*, uint32_t, uint64_t*, size_t) { return 0; }
 
 FunctionDispatcher::ModuleTableInfo* FunctionDispatcher::FindModuleByAddress(uint32_t addr) {
   for (auto& mt : module_tables_) {

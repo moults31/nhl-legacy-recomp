@@ -117,30 +117,53 @@ namespace {
 std::vector<uint8_t> FetchBlocking(const std::string& url,
                                    uint64_t range_start = 0,
                                    uint64_t range_end = 0) {
-    emscripten_fetch_attr_t attr;
-    emscripten_fetch_attr_init(&attr);
-    std::strcpy(attr.requestMethod, "GET");
-    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
-    attr.timeoutMSecs = 30000;
-
-    std::string range_value;
-    const char* extra_hdrs[3] = {nullptr, nullptr, nullptr};
-    if (range_end > range_start) {
-        range_value = "bytes=" + std::to_string(range_start) + "-" +
-                      std::to_string(range_end - 1);
-        extra_hdrs[0] = "Range";
-        extra_hdrs[1] = range_value.c_str();
-        attr.requestHeaders = extra_hdrs;
+    std::string path;
+    // Convert URL to local path: "/data/nhllegacy.bundle" → "/data/nhllegacy.bundle"
+    if (url.find("://") == std::string::npos) {
+        path = url;
     }
 
-    emscripten_fetch_t* fetch = emscripten_fetch(&attr, url.c_str());
-
-    std::vector<uint8_t> result;
-    if (fetch && (fetch->status == 200 || fetch->status == 206) &&
-        fetch->data && fetch->numBytes > 0) {
-        result.assign(fetch->data, fetch->data + fetch->numBytes);
+    // If no path, fall back to HTTP
+    if (path.empty()) {
+        emscripten_fetch_attr_t attr;
+        emscripten_fetch_attr_init(&attr);
+        std::strcpy(attr.requestMethod, "GET");
+        attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;
+        attr.timeoutMSecs = 10000;
+        emscripten_fetch_t* fetch = emscripten_fetch(&attr, url.c_str());
+        std::vector<uint8_t> result;
+        if (fetch && (fetch->status == 200 || fetch->status == 206) &&
+            fetch->data && fetch->numBytes > 0) {
+            result.assign(fetch->data, fetch->data + fetch->numBytes);
+        }
+        if (fetch) emscripten_fetch_close(fetch);
+        return result;
     }
-    if (fetch) emscripten_fetch_close(fetch);
+
+    // Read from embedded virtual filesystem
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) {
+        std::fprintf(stderr, "[vfs] FetchBlocking: fopen '%s' failed\n", path.c_str());
+        return {};
+    }
+
+    // Seek to range start
+    if (range_start > 0) {
+        fseek(f, static_cast<long>(range_start), SEEK_SET);
+    }
+
+    size_t size = range_end > range_start ? static_cast<size_t>(range_end - range_start) : 0;
+    if (size == 0) {
+        // Read entire file
+        fseek(f, 0, SEEK_END);
+        size = static_cast<size_t>(ftell(f));
+        fseek(f, 0, SEEK_SET);
+    }
+
+    std::vector<uint8_t> result(size);
+    size_t bytes_read = fread(result.data(), 1, size, f);
+    fclose(f);
+    result.resize(bytes_read);
     return result;
 }
 

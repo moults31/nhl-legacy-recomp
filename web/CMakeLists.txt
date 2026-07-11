@@ -60,6 +60,8 @@ set(WASM_SOURCES
   ${SDK_SYSTEM_SRC}/xthread.cpp
   ${SDK_SYSTEM_SRC}/runtime.cpp
   ${SDK_SYSTEM_SRC}/user_module.cpp
+  ${SDK_SYSTEM_SRC}/xex_module.cpp
+  ${SDK_SYSTEM_SRC}/elf_module.cpp
 )
 
 add_executable(nhllegacy ${WASM_SOURCES})
@@ -77,6 +79,7 @@ target_link_options(nhllegacy PRIVATE
   -O1
   -g0
   -sFETCH
+  --embed-file ${CMAKE_SOURCE_DIR}/../data/nhllegacy.bundle@/data/nhllegacy.bundle
   -sWASM_BIGINT
   -sALLOW_MEMORY_GROWTH=1
   -sMAXIMUM_MEMORY=4294967296
