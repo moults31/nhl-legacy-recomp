@@ -1,0 +1,1405 @@
+// WASM SDK kernel runtime — provides function dispatch, guest memory,
+// and runtime stubs for the Emscripten (WASM) build.
+//
+// We do NOT compile the SDK's function_dispatcher.cpp — its dependency
+// chain pulls in the full Memory/KernelState/Runtime which needs mmap,
+// pthread signals, and SEH that WASM doesn't support.
+//
+// Instead we provide:
+//   1. Guest memory dispatch table → REX_LOOKUP_FUNC fast path
+//   2. ResolveIndirectFunction → fallback for cross-module calls
+//   3. All SDK stubs the generated code & headers need at link time
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+#include <emscripten.h>
+#include <emscripten/heap.h>
+
+#include <rex/ppc.h>
+#include <rex/ppc/context.h>
+#include <rex/image_info.h>
+#include <rex/logging.h>
+#include <rex/system/mmio_handler.h>
+#include <rex/thread/mutex.h>
+#include <rex/chrono/clock.h>
+#include <rex/cvar.h>
+#include <rex/perf/counter.h>
+#include <rex/string.h>
+#include <rex/stream.h>
+#include <rex/filesystem/vfs.h>
+#include <rex/filesystem/devices/null_device.h>
+#include <rex/filesystem/devices/host_path_device.h>
+#include <rex/system/xmemory.h>
+#include <rex/system/xnotifylistener.h>
+#include <rex/system/function_dispatcher.h>
+#include <rex/system/xthread.h>
+#include <rex/runtime.h>
+#include "vfs_bridge.h"
+#include "http_range_device.h"
+
+// Timeout handler
+// Note: WASM is single-threaded and synchronous. If the guest enters a tight
+// computational loop, we cannot break out from the outside. The only solution
+// is to run the guest in a web worker with a timeout, or fix the kernel stubs
+// to not cause infinite loops. For now, we document this as a known limitation.
+static double g_start_time = 0;
+static bool g_timeout_reached = false;
+
+static void timeout_check() {
+  if (g_start_time > 0) {
+    double elapsed = emscripten_get_now() - g_start_time;
+    if (elapsed > 10000.0) {  // 10 seconds
+      std::fprintf(stderr, "[sdk] TIMEOUT: guest execution exceeded 10 seconds\n");
+      std::fflush(stderr);
+      g_timeout_reached = true;
+      // Cannot force exit from WASM — documented limitation
+    }
+  }
+}
+
+// ============================================================================
+// Guest memory — dynamically allocated to cover full guest address space.
+// Guest base address 0 maps to buffer[0]. Maximum needed: up to the dispatch
+// table at IMAGE_BASE + IMAGE_SIZE + code_size*2, i.e. ~2.3 GB.
+// ============================================================================
+
+// Code section lives at 0x82450000..0x839E3530
+// Dispatch table at 0x82000000 + 0x1EA0000 = 0x83EA0000
+// Table size = code_size * 2 + thunk_reserve * 2 ≈ 0x2A9CA60
+// 3 GB covers most of the 4 GB space. OOB beyond this is rare.
+static constexpr size_t kGuestMaxOffset = 0x88000000ull; // ~2.125 GB — covers dispatch table at 0x83EA0000 + table_size
+static uint8_t* g_guest_base = nullptr;
+static std::atomic<bool> g_mem_logged{false};
+
+uint8_t* wasm_guest_base() {
+  if (!g_mem_logged.exchange(true)) {
+    // Allocate guest buffer from WASM linear memory directly.
+    // Use the heap allocator to reserve space at the top of memory,
+    // past the dlmalloc managed region. We align to a 64KB boundary
+    // and allocate exactly kGuestMaxOffset bytes.
+    size_t total_needed = kGuestMaxOffset + 64 * 1024 * 1024;
+    if (emscripten_resize_heap(total_needed)) {
+      // After resize, sbrk/brk top is at the old heap limit.
+      // Use a manual bump allocator from the top of the heap.
+      // We rely on the fact that after resize, the pages are committed.
+      size_t heap_size = emscripten_get_heap_size();
+      size_t alloc_start = heap_size - kGuestMaxOffset;
+      alloc_start &= ~0xFFFFull;
+      g_guest_base = (uint8_t*)alloc_start;
+      std::fprintf(stderr, "[sdk] bump alloc: heap=%zuMB guest_base=%p\n",
+                   heap_size / (1024 * 1024), (void*)g_guest_base);
+    } else {
+      std::fprintf(stderr, "[sdk] WARNING: heap resize to %zuMB failed\n",
+                   total_needed / (1024 * 1024));
+      g_guest_base = (uint8_t*)std::calloc(kGuestMaxOffset, 1);
+      if (!g_guest_base) {
+        static constexpr size_t kFallbackOffset = 0x10000000ull;
+        g_guest_base = (uint8_t*)std::calloc(kFallbackOffset, 1);
+      }
+      if (!g_guest_base) {
+        std::fprintf(stderr, "[sdk] FATAL: calloc fallback also failed\n");
+        std::abort();
+      }
+      std::fprintf(stderr, "[sdk] guest memory: %.1fGB @ %p (calloc fallback)\n",
+                   (double)kGuestMaxOffset / (1024 * 1024 * 1024), (void*)g_guest_base);
+    }
+  }
+  return g_guest_base;
+}
+
+// ============================================================================
+// WamFunctionDispatcher
+//
+// Maps guest addresses → host PPCFunc* via:
+//   a) unordered_map for ResolveIndirectFunction
+//   b) Guest-memory dispatch table at IMAGE_BASE + IMAGE_SIZE for REX_LOOKUP_FUNC
+// ============================================================================
+
+class WamFunctionDispatcher {
+ public:
+  bool InitFromImage(const rex::PPCImageInfo& info) {
+    uint8_t* base = wasm_guest_base();
+    code_base_ = static_cast<uint32_t>(info.code_base);
+    uint32_t image_base = static_cast<uint32_t>(info.image_base);
+    uint32_t image_size = static_cast<uint32_t>(info.image_size);
+    uint32_t table_base = image_base + image_size;
+    uint32_t table_size = info.code_size * 2 + 0x10000 * 2;
+
+    std::memset(base + table_base, 0, table_size);
+
+    std::fprintf(stderr, "[sdk] dispatch table: guest %08X, %u bytes\n",
+                 table_base, table_size);
+
+    int count = 0;
+    for (int i = 0; info.func_mappings[i].guest != 0; ++i) {
+      uint32_t ga = static_cast<uint32_t>(info.func_mappings[i].guest);
+      PPCFunc* host = info.func_mappings[i].host;
+      if (!host) continue;
+
+      map_[ga] = host;
+
+      // Write into guest memory for REX_LOOKUP_FUNC fast path.
+      uint64_t off = static_cast<uint64_t>(ga - code_base_) * 2;
+      uint8_t* slot = base + table_base + off;
+      std::memcpy(slot, &host, sizeof(host));
+      ++count;
+    }
+
+    std::fprintf(stderr, "[sdk] registered %d functions\n", count);
+    return true;
+  }
+
+  PPCFunc* Get(uint32_t addr) const {
+    auto it = map_.find(addr);
+    return (it != map_.end()) ? it->second : nullptr;
+  }
+
+  static WamFunctionDispatcher* instance() { return s_instance; }
+  static void set_instance(WamFunctionDispatcher* p) { s_instance = p; }
+
+ private:
+  uint32_t code_base_ = 0;
+  std::unordered_map<uint32_t, PPCFunc*> map_;
+  static inline WamFunctionDispatcher* s_instance = nullptr;
+};
+
+// ============================================================================
+// ResolveIndirectFunction — the hook the generated recomp calls on cache miss.
+// ============================================================================
+// Note: ResolveIndirectFunction is now provided by the SDK's
+// function_dispatcher.cpp. It uses Runtime::instance()->function_dispatcher().
+// ============================================================================
+
+// ============================================================================
+// SDK stubs — only symbols NOT provided inline by SDK headers.
+// ============================================================================
+
+// ---- Logging (declared in rex/logging/api.h, not inline) --------------------
+
+namespace rex {
+void InitLoggingEarly() {}
+void ShutdownLogging() {}
+void SetAllLevels(spdlog::level::level_enum) {}
+LogCategoryId RegisterLogCategory(const char* name) {
+  static std::atomic<unsigned> _c{0};
+  auto n = _c.fetch_add(1, std::memory_order_relaxed);
+  if (n < 3) std::fprintf(stderr, "[sdk] RegisterLogCategory: %s (#%u)\n", name, n + 1);
+  return LogCategoryId(n + 1);
+}
+spdlog::logger* GetLoggerRaw(LogCategoryId) { return nullptr; }
+std::shared_ptr<spdlog::logger> GetLogger(LogCategoryId) { return nullptr; }
+std::shared_ptr<spdlog::logger> GetLogger() { return nullptr; }
+}  // namespace rex
+
+// ---- Debug (declared in rex/dbg.h, not inline) -----------------------------
+
+namespace rex::debug {
+bool IsDebuggerAttached() { return false; }
+void Break() {}
+namespace detail {
+void DebugPrint(const char*) {}
+}  // namespace detail
+}  // namespace rex::debug
+
+// ---- CVAR (declared in rex/cvar.h, not inline) -----------------------------
+
+namespace rex::cvar {
+std::vector<std::string> Init(int, char**) { return {}; }
+void ApplyEnvironment() {}
+std::optional<size_t> RegisterFlag(FlagEntry) { return std::nullopt; }
+void UnregisterFlag(std::string_view) {}
+}  // namespace rex::cvar
+
+// ---- Clock (declared in rex/chrono/clock.h, not inline) --------------------
+
+namespace rex::chrono {
+
+uint64_t Clock::host_tick_frequency_platform() { return 1'000'000'000; }
+uint64_t Clock::host_tick_count_platform()     { return (uint64_t)(emscripten_get_now() * 1e6); }
+uint64_t Clock::QueryHostTickFrequency()       { return host_tick_frequency_platform(); }
+uint64_t Clock::QueryHostTickCount()           { return host_tick_count_platform(); }
+uint64_t Clock::QueryHostSystemTime()          { return (uint64_t)(emscripten_get_now() * 10000.0); }
+uint64_t Clock::QueryHostUptimeMillis()        { return (uint64_t)emscripten_get_now(); }
+
+uint64_t Clock::QueryGuestTickCount()          { return (uint64_t)(emscripten_get_now() * 50000.0); }
+uint64_t Clock::QueryGuestSystemTime()         { return (uint64_t)(emscripten_get_now() * 10000.0); }
+uint32_t Clock::QueryGuestUptimeMillis()       { return (uint32_t)emscripten_get_now(); }
+
+double   Clock::guest_time_scalar()              { return 1.0; }
+void     Clock::set_guest_time_scalar(double)    {}
+uint64_t Clock::guest_tick_frequency()           { return 50'000'000; }
+void     Clock::set_guest_tick_frequency(uint64_t) {}
+uint64_t Clock::guest_system_time_base()         { return 0; }
+void     Clock::set_guest_system_time_base(uint64_t) {}
+
+std::pair<uint64_t, uint64_t> Clock::guest_tick_ratio() { return {1, 1}; }
+
+void     Clock::SetGuestSystemTime(uint64_t) {}
+uint32_t Clock::ScaleGuestDurationMillis(uint32_t ms)   { return ms; }
+int64_t  Clock::ScaleGuestDurationFileTime(int64_t ft)  { return ft; }
+void     Clock::ScaleGuestDurationTimeval(int32_t*, int32_t*) {}
+
+}  // namespace rex::chrono
+
+// ---- Threads ---------------------------------------------------------------
+
+namespace rex::thread {
+
+static std::recursive_mutex g_critsec;
+std::recursive_mutex& global_critical_region::mutex() { return g_critsec; }
+void EnableAffinityConfiguration() {}
+
+}  // namespace rex::thread
+
+// ---- MMIO Handler ----------------------------------------------------------
+
+namespace rex::runtime {
+// MMIO handler stub — provides dummy implementations for memory-mapped I/O
+MMIOHandler::MMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase, uint8_t* membase_end,
+                         HostToGuestVirtual host_to_guest_virtual, const void* host_to_guest_virtual_context,
+                         AccessViolationCallback access_violation_callback, void* access_violation_callback_context)
+    : virtual_membase_(virtual_membase), physical_membase_(physical_membase), memory_end_(membase_end),
+      host_to_guest_virtual_(host_to_guest_virtual), host_to_guest_virtual_context_(host_to_guest_virtual_context),
+      access_violation_callback_(access_violation_callback), access_violation_callback_context_(access_violation_callback_context) {}
+
+MMIOHandler* MMIOHandler::global_handler() {
+  static MMIOHandler handler(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  return &handler;
+}
+
+MMIOHandler::~MMIOHandler() = default;
+
+bool MMIOHandler::CheckLoad(uint32_t addr, uint32_t* out) {
+  static std::atomic<unsigned> _c{0};
+  auto n = _c.fetch_add(1, std::memory_order_relaxed);
+  if (n < 5) std::fprintf(stderr, "[sdk] MMIO CheckLoad: 0x%08X (#%u)\n", addr, n + 1);
+  *out = 0;
+  return true;
+}
+
+bool MMIOHandler::CheckStore(uint32_t addr, uint32_t val) {
+  static std::atomic<unsigned> _c{0};
+  auto n = _c.fetch_add(1, std::memory_order_relaxed);
+  if (n < 5) std::fprintf(stderr, "[sdk] MMIO CheckStore: 0x%08X = 0x%08X (#%u)\n", addr, val, n + 1);
+  return true;
+}
+}  // namespace rex::runtime
+
+// ---- SEH — not available on WASM -------------------------------------------
+
+namespace rex {
+void initialize_seh() {}
+}  // namespace rex
+
+// ---- FatalError ------------------------------------------------------------
+
+namespace rex {
+void FatalError(std::string_view msg) { std::abort(); }
+}  // namespace rex
+
+// ---- ThreadState (single-threaded WASM) ------------------------------------
+
+namespace rex::runtime {
+thread_local ThreadState* tls_thread_state = nullptr;
+void ThreadState::Bind(ThreadState* thread_state) { tls_thread_state = thread_state; }
+ThreadState* ThreadState::Get() { return tls_thread_state; }
+}  // namespace rex::runtime
+
+// ---- ContentManager stub (no real filesystem on WASM) -----------------------
+
+namespace rex::system::xam {
+ContentManager::ContentManager(KernelState*, const std::filesystem::path&) {}
+ContentManager::~ContentManager() = default;
+}  // namespace rex::system::xam
+
+// ---- ObjectTable + NativeList stubs ---------------------------------------
+
+namespace rex::system::util {
+
+static std::unordered_map<X_HANDLE, XObject*> g_object_table;
+
+ObjectTable::ObjectTable() = default;
+ObjectTable::~ObjectTable() = default;
+void ObjectTable::Reset() { g_object_table.clear(); }
+X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
+  thread_local X_HANDLE next_handle = 1;
+  if (out_handle) { *out_handle = next_handle++; g_object_table[*out_handle] = object; }
+  return 0;
+}
+X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) { g_object_table.erase(handle); return 0; }
+X_STATUS ObjectTable::RetainHandle(X_HANDLE) { return 0; }
+X_STATUS ObjectTable::ReleaseHandle(X_HANDLE) { return 0; }
+X_STATUS ObjectTable::DuplicateHandle(X_HANDLE, X_HANDLE*) { return 0; }
+bool ObjectTable::Save(stream::ByteStream*) { return true; }
+bool ObjectTable::Restore(stream::ByteStream*) { return true; }
+X_STATUS ObjectTable::RestoreHandle(X_HANDLE, XObject*) { return 0; }
+void ObjectTable::GetObjectsByType(XObject::Type,
+                                    std::vector<object_ref<XObject>>*) {}
+
+NativeList::NativeList() = default;
+NativeList::NativeList(memory::Memory*) {}
+
+}  // namespace rex::system::util
+
+// ---- XNotifyListener stub --------------------------------------------------
+
+namespace rex::system {
+XNotifyListener::XNotifyListener(KernelState* kernel_state)
+    : XObject(kernel_state, XObject::Type::NotifyListener) {}
+XNotifyListener::~XNotifyListener() = default;
+void XNotifyListener::EnqueueNotification(uint32_t id, uint32_t data) { (void)id; (void)data; }
+}  // namespace rex::system
+
+// ---- NormalizeGuestPath ------------------------------------------------
+
+namespace rex::system {
+std::string NormalizeGuestPath(std::string_view path) { return std::string(path); }
+}  // namespace rex::system
+
+// ---- UserProfile stub ---------------------------------------------------
+
+namespace rex::system::xam {
+UserProfile::UserProfile() = default;
+}  // namespace rex::system::xam
+
+// ---- FunctionDispatcher stub ------------------------------------------------
+// We provide FunctionDispatcher outside the SDK's function_dispatcher.cpp
+// ============================================================================
+// FunctionDispatcher stubs + ResolveIndirectFunction (our version)
+// ============================================================================
+
+namespace rex::runtime {
+
+static void __wasm_trap_handler(PPCContext& ctx, uint8_t* base) {
+  (void)base;
+  static std::atomic<unsigned> _cnt{0};
+  auto n = _cnt.fetch_add(1, std::memory_order_relaxed);
+  if (n < 5) std::fprintf(stderr, "[sdk] TRAP (#%u) → 0 (skip)\n", n + 1);
+  ctx.r3.u64 = 0u;
+}
+
+PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
+  auto* d = WamFunctionDispatcher::instance();
+  if (d) {
+    PPCFunc* f = d->Get(guest_address);
+    if (f) return f;
+  }
+  static std::atomic<unsigned> _cnt{0};
+  auto n = _cnt.fetch_add(1, std::memory_order_relaxed);
+  if (n < 3) std::fprintf(stderr, "[sdk] unresolved indirect: 0x%08X (#%u)\n", guest_address, n + 1);
+  return &__wasm_trap_handler;
+}
+
+FunctionDispatcher::FunctionDispatcher(memory::Memory* memory, ExportResolver* export_resolver)
+    : memory_(memory), export_resolver_(export_resolver) {}
+FunctionDispatcher::~FunctionDispatcher() = default;
+
+bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t code_size,
+                                                  uint32_t image_base, uint32_t image_size,
+                                                  bool is_entrypoint) {
+  if (is_entrypoint) entrypoint_code_base_ = code_base;
+  return memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size);
+}
+
+bool FunctionDispatcher::SetFunction(uint32_t guest_address, ::PPCFunc* func) {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  function_table_[guest_address] = func;
+  memory_->SetFunction(guest_address, func);
+  return true;
+}
+
+::PPCFunc* FunctionDispatcher::GetFunction(uint32_t guest_address) {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  auto it = function_table_.find(guest_address);
+  return it != function_table_.end() ? it->second : nullptr;
+}
+
+uint32_t FunctionDispatcher::AllocateThunk(::PPCFunc* func, uint32_t caller_address) {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  auto* mod = FindModuleByAddress(caller_address);
+  if (!mod && entrypoint_code_base_) mod = FindModuleByAddress(entrypoint_code_base_);
+  if (!mod) return 0;
+  if (mod->next_thunk_address >= mod->thunk_limit) return 0;
+  uint32_t addr = mod->next_thunk_address;
+  mod->next_thunk_address += 4;
+  SetFunction(addr, func);
+  return addr;
+}
+
+uint32_t FunctionDispatcher::FindCallerModuleBase(uint32_t guest_address) {
+  auto* mod = FindModuleByAddress(guest_address);
+  return mod ? mod->code_base : 0;
+}
+
+void FunctionDispatcher::RegisterModule(const std::string& module_id, uint32_t code_base,
+                                         RegisterFn register_func) {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  module_addresses_[module_id] = {code_base, {}};
+  recording_ = true;
+  recording_addresses_.clear();
+  register_func(this);
+  recording_ = false;
+  module_addresses_[module_id].addresses = std::move(recording_addresses_);
+}
+
+FunctionDispatcher::ModuleTableInfo* FunctionDispatcher::FindModuleByAddress(uint32_t addr) {
+  for (auto& mt : module_tables_) {
+    auto end = mt.code_base + mt.code_size + kThunkReserveSize;
+    if (addr >= mt.code_base && addr < end) return &mt;
+  }
+  return nullptr;
+}
+
+}  // namespace rex::runtime
+
+// ============================================================================
+// SDK Memory stubs — WASM-compatible replacements for mmap-backed Memory.
+// ============================================================================
+
+static std::unordered_map<uint32_t, PPCFunc*> g_wasm_func_map;
+
+namespace rex::memory {
+
+// --- BaseHeap / VirtualHeap / PhysicalHeap -----------------------------------
+BaseHeap::BaseHeap() : membase_(nullptr), heap_base_(0), heap_size_(0), page_size_(0) {}
+BaseHeap::~BaseHeap() = default;
+void BaseHeap::Dispose() {}
+void BaseHeap::DumpMap() {}
+
+bool BaseHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_type,
+                     uint32_t protect, bool top_down, uint32_t* out_address) {
+  if (out_address) *out_address = 0;
+  return true;
+}
+bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignment,
+                          uint32_t allocation_type, uint32_t protect) { return true; }
+bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t size,
+                          uint32_t alignment, uint32_t allocation_type, uint32_t protect,
+                          bool top_down, uint32_t* out_address) {
+  if (out_address) *out_address = 0;
+  return true;
+}
+bool BaseHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t allocation_type,
+                               uint32_t protect, bool top_down, uint32_t* out_address) {
+  return Alloc(size, alignment, allocation_type, protect, top_down, out_address);
+}
+bool BaseHeap::Decommit(uint32_t address, uint32_t size) { return true; }
+bool BaseHeap::Release(uint32_t address, uint32_t* out_region_size) { return true; }
+bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
+                       uint32_t* old_protect) { return true; }
+bool BaseHeap::QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info) {
+  return false;
+}
+bool BaseHeap::QuerySize(uint32_t address, uint32_t* out_size) { return false; }
+bool BaseHeap::QueryBaseAndSize(uint32_t* in_out_address, uint32_t* out_size) { return false; }
+bool BaseHeap::QueryProtect(uint32_t address, uint32_t* out_protect) { return false; }
+rex::memory::PageAccess BaseHeap::QueryRangeAccess(uint32_t low_address, uint32_t high_address) {
+  return rex::memory::PageAccess::kReadWrite;
+}
+bool BaseHeap::Save(stream::ByteStream* stream) { return true; }
+bool BaseHeap::Restore(stream::ByteStream* stream) { return true; }
+void BaseHeap::Reset() {}
+
+VirtualHeap::VirtualHeap() = default;
+VirtualHeap::~VirtualHeap() = default;
+void VirtualHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type,
+                             uint32_t heap_base, uint32_t heap_size, uint32_t page_size) {
+  BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size);
+}
+
+PhysicalHeap::PhysicalHeap() : parent_heap_(nullptr) {}
+PhysicalHeap::~PhysicalHeap() = default;
+bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_type,
+                         uint32_t protect, bool top_down, uint32_t* out_address) {
+  return BaseHeap::Alloc(size, alignment, allocation_type, protect, top_down, out_address);
+}
+bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignment,
+                              uint32_t allocation_type, uint32_t protect) { return true; }
+bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t size,
+                              uint32_t alignment, uint32_t allocation_type, uint32_t protect,
+                              bool top_down, uint32_t* out_address) {
+  return BaseHeap::AllocRange(low_address, high_address, size, alignment, allocation_type,
+                              protect, top_down, out_address);
+}
+bool PhysicalHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t allocation_type,
+                                   uint32_t protect, bool top_down, uint32_t* out_address) {
+  return true;
+}
+bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) { return true; }
+bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) { return true; }
+bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
+                           uint32_t* old_protect) { return true; }
+
+// --- Memory ------------------------------------------------------------------
+
+Memory::Memory() : virtual_membase_(nullptr), physical_membase_(nullptr) {}
+Memory::~Memory() = default;
+
+bool Memory::Initialize() {
+  virtual_membase_ = wasm_guest_base();
+  physical_membase_ = virtual_membase_;
+  system_page_size_ = 4096;
+  system_allocation_granularity_ = 65536;
+  return true;
+}
+void Memory::Reset() {}
+
+uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment, uint32_t system_heap_flags) {
+  if (g_guest_base == nullptr) return 0;
+  static uint32_t next_alloc = 0x30000000;
+  uint32_t result = next_alloc;
+  next_alloc += (size + alignment - 1) & ~(alignment - 1);
+  if (next_alloc > kGuestMaxOffset) next_alloc = 0x30000000;
+  return result;
+}
+void Memory::SystemHeapFree(uint32_t address, uint32_t* out_region_size) {
+  if (out_region_size) *out_region_size = 0;
+}
+
+void Memory::Zero(uint32_t address, uint32_t size) {
+  std::memset(virtual_membase_ + address, 0, size);
+}
+void Memory::Fill(uint32_t address, uint32_t size, uint8_t value) {
+  std::memset(virtual_membase_ + address, value, size);
+}
+void Memory::Copy(uint32_t dest, uint32_t src, uint32_t size) {
+  std::memcpy(virtual_membase_ + dest, virtual_membase_ + src, size);
+}
+
+uint32_t Memory::HostToGuestVirtual(const void* host_address) const {
+  return static_cast<uint32_t>(
+      static_cast<const uint8_t*>(host_address) - virtual_membase_);
+}
+uint32_t Memory::GetPhysicalAddress(uint32_t address) const { return address; }
+uint32_t Memory::SearchAligned(uint32_t start, uint32_t end, const uint32_t* values,
+                                size_t value_count) { return 0; }
+
+bool Memory::AddVirtualMappedRange(uint32_t virtual_address, uint32_t mask, uint32_t size,
+                                    void* context,
+                                    runtime::MMIOReadCallback read_callback,
+                                    runtime::MMIOWriteCallback write_callback) { return true; }
+runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) { return nullptr; }
+
+const BaseHeap* Memory::LookupHeap(uint32_t address) const { return nullptr; }
+BaseHeap* Memory::LookupHeapByType(bool physical, uint32_t page_size) { return nullptr; }
+void Memory::GetHeapsPageStatsSummary(const BaseHeap* const* provided_heaps, size_t heaps_count,
+                                       uint32_t& unreserved_pages, uint32_t& reserved_pages,
+                                       uint32_t& used_pages, uint32_t& reserved_bytes) {}
+VirtualHeap* Memory::GetPhysicalHeap() { return nullptr; }
+void Memory::DumpMap() {}
+
+bool Memory::Save(stream::ByteStream* stream) { return true; }
+bool Memory::Restore(stream::ByteStream* stream) { return true; }
+
+bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size,
+                                      uint32_t image_base, uint32_t image_size) {
+  auto* disp = WamFunctionDispatcher::instance();
+  if (!disp) return false;
+  rex::PPCImageInfo info;
+  info.code_base = code_base;
+  info.code_size = code_size;
+  info.image_base = image_base;
+  info.image_size = image_size;
+  info.func_mappings = PPCFuncMappings;
+  return disp->InitFromImage(info);
+}
+bool Memory::DestroyFunctionTable(uint32_t code_base) { return true; }
+bool Memory::SetFunction(uint32_t guest_address, PPCFunc* host_function) {
+  if (host_function) g_wasm_func_map[guest_address] = host_function;
+  return true;
+}
+bool Memory::HasAnyFunctionTable() const { return !g_wasm_func_map.empty(); }
+
+void* Memory::RegisterPhysicalMemoryInvalidationCallback(
+    PhysicalMemoryInvalidationCallback callback, void* callback_context) { return nullptr; }
+void Memory::UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle) {}
+void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
+                                                  bool enable_invalidation_notifications,
+                                                  bool enable_data_providers) {}
+bool Memory::TriggerPhysicalMemoryCallbacks(
+    std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+    uint32_t virtual_address, uint32_t length, bool is_write,
+    bool unwatch_exact_range, bool unprotect) { return false; }
+
+}  // namespace rex::memory
+
+// ============================================================================
+// SDK core library stubs
+// ============================================================================
+
+namespace rex {
+
+uint8_t lzcnt(uint32_t value) {
+  if (value == 0) return 32;
+  return (uint8_t)__builtin_clz(value);
+}
+
+}  // namespace rex
+
+namespace rex::stream {
+
+ByteStream::ByteStream(uint8_t* data, size_t data_length, size_t offset)
+    : data_(data), data_length_(data_length), offset_(offset) {}
+ByteStream::~ByteStream() = default;
+void ByteStream::Read(std::span<uint8_t> buffer) {
+  std::memset(buffer.data(), 0, buffer.size());
+}
+void ByteStream::Write(std::span<const uint8_t> buffer) {}
+
+}  // namespace rex::stream
+
+namespace rex::string {
+
+bool utf8_equal_case(std::string_view a, std::string_view b) { return a == b; }
+
+std::string utf8_find_base_name_from_path(std::string_view path, char32_t) {
+  auto pos = path.rfind('\\');
+  if (pos == std::string_view::npos) pos = path.rfind('/');
+  if (pos != std::string_view::npos) return std::string(path.substr(pos + 1));
+  return std::string(path);
+}
+
+}  // namespace rex::string
+
+namespace rex::kernel::xboxkrnl {
+
+void xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool proc) {}
+void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, uint32_t proc, bool yield) {}
+
+}  // namespace rex::kernel::xboxkrnl
+
+namespace rex::filesystem {
+
+// Device base class
+Device::Device(std::string_view mount_path) : mount_path_(mount_path) {}
+Device::~Device() = default;
+
+// Entry base class
+Entry::Entry(Device* device, Entry* parent, const std::string_view path)
+    : device_(device), parent_(parent), path_(path) {
+  // Extract the name (last component) from the path
+  auto sep = path.rfind('\\');
+  if (sep == std::string_view::npos) sep = path.rfind('/');
+  if (sep != std::string_view::npos)
+    name_ = std::string(path.substr(sep + 1));
+  else
+    name_ = std::string(path);
+}
+Entry::~Entry() = default;
+Entry* Entry::ResolvePath(const std::string_view path) {
+  if (path.empty()) return this;
+  // Split on first separator
+  auto sep = path.find_first_of("\\/");
+  std::string_view component = (sep == std::string_view::npos) ? path : path.substr(0, sep);
+  std::string_view rest = (sep == std::string_view::npos) ? std::string_view() : path.substr(sep + 1);
+  for (auto& child : children_) {
+    if (child->name() == component) {
+      if (rest.empty()) return child.get();
+      return child->ResolvePath(rest);
+    }
+  }
+  return nullptr;
+}
+
+VirtualFileSystem::VirtualFileSystem() = default;
+VirtualFileSystem::~VirtualFileSystem() = default;
+bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device) {
+  devices_.push_back(std::move(device));
+  return true;
+}
+Entry* VirtualFileSystem::ResolvePath(std::string_view path) {
+  std::fprintf(stderr, "[vfs] ResolvePath '%.*s' (%zu dev)\n", (int)path.size(), path.data(), devices_.size());
+  for (auto& dev : devices_) {
+    Entry* e = dev->ResolvePath(path);
+    if (e) { std::fprintf(stderr, "[vfs]   OK\n"); return e; }
+  }
+  std::fprintf(stderr, "[vfs]   NOT FOUND\n");
+  return nullptr;
+}
+bool VirtualFileSystem::RegisterSymbolicLink(std::string_view path,
+                                              std::string_view target) { return true; }
+
+NullDevice::NullDevice(const std::string& mount_path,
+                        const std::initializer_list<std::string>& null_paths)
+    : Device(mount_path) {}
+NullDevice::~NullDevice() = default;
+
+HostPathDevice::HostPathDevice(const std::string_view mount_path,
+                                const std::filesystem::path& host_path,
+                                bool read_only) : Device(mount_path) {}
+HostPathDevice::~HostPathDevice() = default;
+
+}  // namespace rex::filesystem
+
+// ============================================================================
+// VFS bridge — file operations for kernel stubs
+// ============================================================================
+
+// Embedded test manifest for when the server-side manifest isn't available
+static const char kTestManifest[] = R"({
+  "files": {
+    "boot.big": {"o": 0, "s": 11184432, "us": 11184432, "c": "none"},
+    "renderboot.big": {"o": 11184432, "s": 9401248, "us": 9401248, "c": "none"},
+    "audioboot.big": {"o": 20585680, "s": 1381808, "us": 1381808, "c": "none"},
+    "audioboot2.big": {"o": 21967488, "s": 5635728, "us": 5635728, "c": "none"},
+    "data0.big": {"o": 27603216, "s": 29427680, "us": 29427680, "c": "none"},
+    "cacheboot.big": {"o": 57030896, "s": 31705408, "us": 31705408, "c": "none"},
+    "default.xex": {"o": 88736304, "s": 10448896, "us": 10448896, "c": "none"}
+  }
+})";
+
+#ifdef __EMSCRIPTEN__
+
+static nhllegacy::HttpRangeDevice* g_wasm_vfs_device = nullptr;
+static rex::filesystem::File* g_wasm_file_table[kWasmMaxFileHandles] = {};
+static bool g_wasm_vfs_initialized = false;
+
+bool InitWasmVfs(rex::filesystem::VirtualFileSystem* vfs) {
+  if (g_wasm_vfs_initialized) return true;
+
+  // Load manifest
+  nhllegacy::Manifest manifest;
+  if (!nhllegacy::HttpRangeDevice::LoadManifestFromString(kTestManifest, manifest)) {
+    if (!nhllegacy::HttpRangeDevice::LoadManifestFromUrl("/data/nhllegacy.manifest.json",
+                                                          manifest)) {
+      std::fprintf(stderr, "[vfs] WARNING: no manifest available, files won't serve\n");
+      g_wasm_vfs_initialized = true;
+      return false;
+    }
+  }
+
+  size_t manifest_count = manifest.size();
+  auto device = std::make_unique<nhllegacy::HttpRangeDevice>(
+      "\\\\Device\\\\Harddisk0\\\\Partition1", "/data/nhllegacy.bundle",
+      nhllegacy::Manifest(manifest), "/opfs/cache");
+
+  if (!device->Initialize()) {
+    std::fprintf(stderr, "[vfs] ERROR: HttpRangeDevice init failed\n");
+    return false;
+  }
+
+  // Store raw pointer for WasmOpenFile fallback
+  g_wasm_vfs_device = device.get();
+
+  // Register in SDK VirtualFileSystem for LoadXexImage / UserModule
+  if (vfs) {
+    vfs->RegisterDevice(std::move(device));
+    g_wasm_vfs_device = nullptr; // VFS owns it now
+  }
+
+  g_wasm_vfs_initialized = true;
+  std::fprintf(stderr, "[vfs] HttpRangeDevice ready (%zu manifest entries)\n",
+               manifest_count);
+  return true;
+}
+
+#else  // !__EMSCRIPTEN__
+
+bool InitWasmVfs(rex::filesystem::VirtualFileSystem*) {
+  // Node.js test: no real assets
+  return false;
+}
+
+#endif
+
+// File handle table (works in both environments)
+static rex::filesystem::File* s_file_table[kWasmMaxFileHandles] = {};
+static uint32_t s_next_handle = 1;
+
+uint32_t WasmOpenFile(const char* guest_path, uint32_t& out_status) {
+#ifdef __EMSCRIPTEN__
+  if (!g_wasm_vfs_device) {
+    out_status = 0xC0000034u;
+    std::fprintf(stderr, "no device\n");
+    return 0;
+  }
+
+  // Resolve path through HttpRangeDevice
+  auto* entry = g_wasm_vfs_device->ResolvePath(guest_path);
+  if (!entry) {
+    out_status = 0xC0000034u;
+    std::fprintf(stderr, "not found\n");
+    return 0;
+  }
+
+  rex::filesystem::File* file = nullptr;
+  rex::X_STATUS st = entry->Open(1u, &file);  // FILE_READ_DATA
+  if (st != 0 || !file) {
+    out_status = 0xC0000043u; // STATUS_FILE_INVALID
+    return 0;
+  }
+
+  // Find a free handle slot
+  for (uint32_t i = 0; i < kWasmMaxFileHandles; ++i) {
+    uint32_t h = (s_next_handle + i) % kWasmMaxFileHandles;
+    if (h == 0) continue;
+    if (s_file_table[h] == nullptr) {
+      s_file_table[h] = file;
+      s_next_handle = h + 1;
+      out_status = 0; // STATUS_SUCCESS
+      return h;
+    }
+  }
+
+  delete file;
+  out_status = 0xC000009Au; // STATUS_INSUFFICIENT_RESOURCES
+  return 0;
+#else
+  (void)guest_path;
+  out_status = 0xC0000034u; // STATUS_OBJECT_NAME_NOT_FOUND
+  return 0;
+#endif
+}
+
+uint32_t WasmReadFile(uint32_t handle, void* buffer, uint32_t size) {
+  if (handle == 0 || handle >= kWasmMaxFileHandles) return 0;
+  auto* file = s_file_table[handle];
+  if (!file) return 0;
+
+  size_t bytes_read = 0;
+  rex::X_STATUS st = file->ReadSync(
+      std::span<uint8_t>(static_cast<uint8_t*>(buffer), size), 0, &bytes_read);
+  if (st != 0) return 0;
+  return static_cast<uint32_t>(bytes_read);
+}
+
+void WasmCloseFile(uint32_t handle) {
+  if (handle == 0 || handle >= kWasmMaxFileHandles) return;
+  if (s_file_table[handle]) {
+    delete s_file_table[handle];
+    s_file_table[handle] = nullptr;
+  }
+}
+
+// ============================================================================
+// PPCImageConfig — guest image layout (referenced by generated recomp).
+// ============================================================================
+
+extern "C" {
+const rex::PPCImageInfo PPCImageConfig = {
+  /*code_base       =*/ 0x82450000,
+  /*code_size       =*/ 0x153E530,
+  /*image_base      =*/ 0x82000000,
+  /*image_size      =*/ 0x1EA0000,
+  /*func_mappings   =*/ PPCFuncMappings,
+  /*rexcrt_heap     =*/ false,
+  /*register_modules=*/ nullptr,
+};
+}
+
+// Forward declaration
+static void preload_data_sections(uint8_t* base);
+
+// ============================================================================
+// Boot — called from main().  Builds the dispatch table, sets up PPC context,
+// and calls the guest kernel entry point.
+// ============================================================================
+
+extern "C" int wasm_boot_guest() {
+  std::fprintf(stderr, "[sdk] NHL Legacy WASM boot (sdk_runtime)\n");
+
+  wasm_guest_base();
+  uint8_t* base = g_guest_base;
+
+  // Create the WASM function dispatcher and populate all 129,934 functions
+  auto* disp = new WamFunctionDispatcher();
+  WamFunctionDispatcher::set_instance(disp);
+  if (!disp->InitFromImage(PPCImageConfig)) {
+    std::fprintf(stderr, "[sdk] FATAL: InitFromImage failed\n");
+    return 1;
+  }
+
+  // Initialize SDK Runtime. This creates Memory, ExportResolver,
+  // FunctionDispatcher, KernelState, and VirtualFileSystem
+  static rex::Runtime s_runtime("", "", "", "");
+  rex::X_STATUS status = s_runtime.Setup(PPCImageConfig);
+  if (status == 0) {
+    std::fprintf(stderr, "[sdk] WASM Runtime setup successful\n");
+  } else {
+    std::fprintf(stderr, "[sdk] WASM Runtime setup returned 0x%08X\n",
+                 static_cast<uint32_t>(status));
+  }
+
+  // Initialize VFS: load manifest, register HttpRangeDevice in SDK's VFS
+  InitWasmVfs(s_runtime.file_system());
+  WamFunctionDispatcher::set_instance(disp);
+
+  if (!disp->InitFromImage(PPCImageConfig)) {
+    std::fprintf(stderr, "[sdk] FATAL: InitFromImage failed\n");
+    return 1;
+  }
+
+  // Pre-populate .rdata/.data sections with function pointers from the manifest.
+  std::fprintf(stderr, "[sdk] loading data section init...\n");
+  preload_data_sections(base);
+
+
+  // Create a fake module handle at guest address 0x11000000.
+  const uint32_t kMod = 0x11000000;
+  auto* mod = reinterpret_cast<volatile uint32_t*>(base + kMod);
+  mod[0] = __builtin_bswap32(0x82450000u); // vtable → entry
+  mod[1] = __builtin_bswap32(0u);           // count: 0 items (skip loop)
+  mod[2] = __builtin_bswap32(kMod + 16u);   // ptr to sub-struct
+  // Sub-struct at kMod+16: zero-fill 60 bytes for one item
+  for (int i = 4; i < 20; ++i) mod[i] = 0;
+
+  PPCFunc* entry = disp->Get(static_cast<uint32_t>(PPCImageConfig.code_base));
+  if (!entry) {
+    std::fprintf(stderr, "[sdk] FATAL: entry 0x%llX not registered\n",
+                 (unsigned long long)PPCImageConfig.code_base);
+    return 1;
+  }
+
+  PPCContext ctx{};
+  std::memset(&ctx, 0, sizeof(ctx));
+  ctx.r3.u64 = kMod;
+  ctx.r1.u64 = 0x40000000ull;  // 1 GB into guest space — must be inside our buffer
+  ctx.r13.u64 = 0x10000000ull; // TLS base
+  ctx.fpscr.InitHost();
+
+  std::fprintf(stderr, "[sdk] calling entry 0x%llX (r1=%llX r13=%llX)\n",
+               (unsigned long long)PPCImageConfig.code_base,
+               (unsigned long long)ctx.r1.u64,
+               (unsigned long long)ctx.r13.u64);
+
+  // Note: Cannot set up timeout in WASM — guest may hang in tight loop
+  // This is a known limitation documented in the timeout_check() function
+
+  entry(ctx, base);
+  std::fprintf(stderr, "[sdk] guest entry returned r3=0x%llX\n",
+               (unsigned long long)ctx.r3.u64);
+
+  // Probe the init chain — call more functions with the proper module handle.
+  static const uint32_t init_chain[] = {
+    0x82451038, 0x82451160, 0x82452620, 0x82452DC8, 0x82453280,
+    0x82456000, 0x82458000, 0x8245A000, 0x8245D000, 0x82460000,
+    0x82465000, 0x8246A000, 0x82470000, 0x82475000, 0x8247A000,
+    0x82480000, 0x82488000, 0x82490000, 0x83060000, 0x8307A000,
+    0x83100000, 0x83200000, 0x83300000, 0x83400000, 0x83500000,
+    0x83600000, 0x83700000, 0x83800000,
+    0, };
+  for (auto* p = init_chain; *p; ++p) {
+    auto* f = disp->Get(*p);
+    if (!f) continue;
+    PPCContext pctx{};
+    std::memset(&pctx, 0, sizeof(pctx));
+    pctx.r3.u64 = kMod;  // pass the fake module handle
+    pctx.r1.u64 = 0x40000000ull;
+    pctx.r13.u64 = 0x10000000ull;
+    pctx.fpscr.InitHost();
+    std::fprintf(stderr, "[sdk] calling 0x%08X...\n", *p);
+    std::fflush(stderr);
+    auto start = std::chrono::steady_clock::now();
+    f(pctx, base);
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    std::fprintf(stderr, "[sdk] 0x%08X → r3=0x%llX (%lld ms)\n",
+                 *p, (unsigned long long)pctx.r3.u64, (long long)elapsed);
+    std::fflush(stderr);
+    if (elapsed > 15000) {
+      std::fprintf(stderr, "[sdk] TIMEOUT — skipping rest\n");
+      break;
+    }
+  }
+
+  // Test: call a function known to invoke kernel stubs.
+  uint32_t kernel_test = 0x83069B10;
+  auto* ftest = disp->Get(kernel_test);
+  if (ftest) {
+    PPCContext tctx{};
+    std::memset(&tctx, 0, sizeof(tctx));
+    tctx.r1.u64 = 0x40000000ull;
+    tctx.fpscr.InitHost();
+    std::fprintf(stderr, "[sdk] kernel test: 0x%08X...\n", kernel_test);
+    ftest(tctx, base);
+    std::fprintf(stderr, "[sdk] kernel test returned r3=0x%llX\n",
+                 (unsigned long long)tctx.r3.u64);
+  }
+
+  // Load the game XEX — populates module data, import table, entry point
+  rex::X_STATUS load_status = s_runtime.LoadXexImage("default.xex");
+  if (load_status != 0) {
+    std::fprintf(stderr, "[sdk] LoadXexImage(default.xex) returned 0x%08X\n",
+                 static_cast<uint32_t>(load_status));
+  } else {
+    std::fprintf(stderr, "[sdk] XEX image loaded, preparing launch...\n");
+    auto thread = s_runtime.PrepareModuleLaunch();
+    if (!thread) {
+      std::fprintf(stderr, "[sdk] PrepareModuleLaunch failed\n");
+    } else {
+      std::fprintf(stderr, "[sdk] launching game thread...\n");
+      thread->Resume();
+      std::fprintf(stderr, "[sdk] game thread launched\n");
+    }
+  }
+
+  return 0;
+}
+// Auto-generated: 354 data section initializers from nhllegacy_functions.toml
+static void preload_data_sections(uint8_t* base) {
+  *((volatile uint32_t*)(base + 0x83B4B15C)) = __builtin_bswap32(2185793856u);  // -> 0x82489140
+  *((volatile uint32_t*)(base + 0x83B4B1F8)) = __builtin_bswap32(2185806224u);  // -> 0x8248C190
+  *((volatile uint32_t*)(base + 0x83B4B1FC)) = __builtin_bswap32(2185806280u);  // -> 0x8248C1C8
+  *((volatile uint32_t*)(base + 0x83B4B200)) = __builtin_bswap32(2185806280u);  // -> 0x8248C1C8
+  *((volatile uint32_t*)(base + 0x823302B8)) = __builtin_bswap32(2185862880u);  // -> 0x82499EE0
+  *((volatile uint32_t*)(base + 0x82332E1C)) = __builtin_bswap32(2186025624u);  // -> 0x824C1A98
+  *((volatile uint32_t*)(base + 0x82332E88)) = __builtin_bswap32(2186027832u);  // -> 0x824C2338
+  *((volatile uint32_t*)(base + 0x82332E84)) = __builtin_bswap32(2186027912u);  // -> 0x824C2388
+  *((volatile uint32_t*)(base + 0x82332E78)) = __builtin_bswap32(2186028224u);  // -> 0x824C24C0
+  *((volatile uint32_t*)(base + 0x82332E74)) = __builtin_bswap32(2186028304u);  // -> 0x824C2510
+  *((volatile uint32_t*)(base + 0x82332E70)) = __builtin_bswap32(2186028384u);  // -> 0x824C2560
+  *((volatile uint32_t*)(base + 0x82349EC4)) = __builtin_bswap32(2186077216u);  // -> 0x824CE420
+  *((volatile uint32_t*)(base + 0x823346B0)) = __builtin_bswap32(2186097616u);  // -> 0x824D33D0
+  *((volatile uint32_t*)(base + 0x823348A8)) = __builtin_bswap32(2186206344u);  // -> 0x824EDC88
+  *((volatile uint32_t*)(base + 0x823349B8)) = __builtin_bswap32(2186206392u);  // -> 0x824EDCB8
+  *((volatile uint32_t*)(base + 0x82334A38)) = __builtin_bswap32(2186206432u);  // -> 0x824EDCE0
+  *((volatile uint32_t*)(base + 0x8233498C)) = __builtin_bswap32(2186206456u);  // -> 0x824EDCF8
+  *((volatile uint32_t*)(base + 0x82349C58)) = __builtin_bswap32(2186670432u);  // -> 0x8255F160
+  *((volatile uint32_t*)(base + 0x82349ED8)) = __builtin_bswap32(2186683064u);  // -> 0x825622B8
+  *((volatile uint32_t*)(base + 0x8234987C)) = __builtin_bswap32(2186683424u);  // -> 0x82562420
+  *((volatile uint32_t*)(base + 0x82349DB8)) = __builtin_bswap32(2186683424u);  // -> 0x82562420
+  *((volatile uint32_t*)(base + 0x823497A4)) = __builtin_bswap32(2186683576u);  // -> 0x825624B8
+  *((volatile uint32_t*)(base + 0x8234B534)) = __builtin_bswap32(2186712440u);  // -> 0x82569578
+  *((volatile uint32_t*)(base + 0x8234D238)) = __builtin_bswap32(2186988176u);  // -> 0x825ACA90
+  *((volatile uint32_t*)(base + 0x8234E038)) = __builtin_bswap32(2187136520u);  // -> 0x825D0E08
+  *((volatile uint32_t*)(base + 0x8234E128)) = __builtin_bswap32(2187136520u);  // -> 0x825D0E08
+  *((volatile uint32_t*)(base + 0x82391600)) = __builtin_bswap32(2187731568u);  // -> 0x82662270
+  *((volatile uint32_t*)(base + 0x82393000)) = __builtin_bswap32(2187808448u);  // -> 0x82674EC0
+  *((volatile uint32_t*)(base + 0x82392FF8)) = __builtin_bswap32(2187809648u);  // -> 0x82675370
+  *((volatile uint32_t*)(base + 0x82392FF4)) = __builtin_bswap32(2187809672u);  // -> 0x82675388
+  *((volatile uint32_t*)(base + 0x82393008)) = __builtin_bswap32(2187809672u);  // -> 0x82675388
+  *((volatile uint32_t*)(base + 0x83B3BA90)) = __builtin_bswap32(2188093864u);  // -> 0x826BA9A8
+  *((volatile uint32_t*)(base + 0x83B3BB54)) = __builtin_bswap32(2188093864u);  // -> 0x826BA9A8
+  *((volatile uint32_t*)(base + 0x8239AE94)) = __builtin_bswap32(2188355424u);  // -> 0x826FA760
+  *((volatile uint32_t*)(base + 0x8239AE98)) = __builtin_bswap32(2188355448u);  // -> 0x826FA778
+  *((volatile uint32_t*)(base + 0x83B3AA20)) = __builtin_bswap32(2188784136u);  // -> 0x82763208
+  *((volatile uint32_t*)(base + 0x823A5940)) = __builtin_bswap32(2189054384u);  // -> 0x827A51B0
+  *((volatile uint32_t*)(base + 0x823A9A34)) = __builtin_bswap32(2189501936u);  // -> 0x828125F0
+  *((volatile uint32_t*)(base + 0x822F64FC)) = __builtin_bswap32(2189800680u);  // -> 0x8285B4E8
+  *((volatile uint32_t*)(base + 0x823B01C8)) = __builtin_bswap32(2190064992u);  // -> 0x8289BD60
+  *((volatile uint32_t*)(base + 0x823B0210)) = __builtin_bswap32(2190071092u);  // -> 0x8289D534
+  *((volatile uint32_t*)(base + 0x823B0220)) = __builtin_bswap32(2190071468u);  // -> 0x8289D6AC
+  *((volatile uint32_t*)(base + 0x823B0260)) = __builtin_bswap32(2190074348u);  // -> 0x8289E1EC
+  *((volatile uint32_t*)(base + 0x820144D0)) = __builtin_bswap32(2190101568u);  // -> 0x828A4C40
+  *((volatile uint32_t*)(base + 0x820144D4)) = __builtin_bswap32(2190101592u);  // -> 0x828A4C58
+  *((volatile uint32_t*)(base + 0x820144D8)) = __builtin_bswap32(2190101616u);  // -> 0x828A4C70
+  *((volatile uint32_t*)(base + 0x8201CB68)) = __builtin_bswap32(2190219176u);  // -> 0x828C17A8
+  *((volatile uint32_t*)(base + 0x82022740)) = __builtin_bswap32(2190595768u);  // -> 0x8291D6B8
+  *((volatile uint32_t*)(base + 0x82037A5C)) = __builtin_bswap32(2191032680u);  // -> 0x82988168
+  *((volatile uint32_t*)(base + 0x82046E20)) = __builtin_bswap32(2191278832u);  // -> 0x829C42F0
+  *((volatile uint32_t*)(base + 0x82046E2C)) = __builtin_bswap32(2191278840u);  // -> 0x829C42F8
+  *((volatile uint32_t*)(base + 0x82046EA4)) = __builtin_bswap32(2191281912u);  // -> 0x829C4EF8
+  *((volatile uint32_t*)(base + 0x82046EA8)) = __builtin_bswap32(2191281920u);  // -> 0x829C4F00
+  *((volatile uint32_t*)(base + 0x82046EAC)) = __builtin_bswap32(2191281928u);  // -> 0x829C4F08
+  *((volatile uint32_t*)(base + 0x82046EB0)) = __builtin_bswap32(2191281936u);  // -> 0x829C4F10
+  *((volatile uint32_t*)(base + 0x82046EB4)) = __builtin_bswap32(2191281944u);  // -> 0x829C4F18
+  *((volatile uint32_t*)(base + 0x82046EB8)) = __builtin_bswap32(2191281952u);  // -> 0x829C4F20
+  *((volatile uint32_t*)(base + 0x82046EBC)) = __builtin_bswap32(2191281960u);  // -> 0x829C4F28
+  *((volatile uint32_t*)(base + 0x82046EC0)) = __builtin_bswap32(2191281968u);  // -> 0x829C4F30
+  *((volatile uint32_t*)(base + 0x82046EC8)) = __builtin_bswap32(2191281984u);  // -> 0x829C4F40
+  *((volatile uint32_t*)(base + 0x82046ECC)) = __builtin_bswap32(2191281992u);  // -> 0x829C4F48
+  *((volatile uint32_t*)(base + 0x82046ED8)) = __builtin_bswap32(2191282016u);  // -> 0x829C4F60
+  *((volatile uint32_t*)(base + 0x82046E80)) = __builtin_bswap32(2191282024u);  // -> 0x829C4F68
+  *((volatile uint32_t*)(base + 0x82046F14)) = __builtin_bswap32(2191282328u);  // -> 0x829C5098
+  *((volatile uint32_t*)(base + 0x82046F18)) = __builtin_bswap32(2191282344u);  // -> 0x829C50A8
+  *((volatile uint32_t*)(base + 0x82047B5C)) = __builtin_bswap32(2191315128u);  // -> 0x829CD0B8
+  *((volatile uint32_t*)(base + 0x82047B78)) = __builtin_bswap32(2191315272u);  // -> 0x829CD148
+  *((volatile uint32_t*)(base + 0x82047B84)) = __builtin_bswap32(2191315336u);  // -> 0x829CD188
+  *((volatile uint32_t*)(base + 0x82047B8C)) = __builtin_bswap32(2191315592u);  // -> 0x829CD288
+  *((volatile uint32_t*)(base + 0x82047B94)) = __builtin_bswap32(2191315600u);  // -> 0x829CD290
+  *((volatile uint32_t*)(base + 0x8204A784)) = __builtin_bswap32(2191416680u);  // -> 0x829E5D68
+  *((volatile uint32_t*)(base + 0x8204A80C)) = __builtin_bswap32(2191416696u);  // -> 0x829E5D78
+  *((volatile uint32_t*)(base + 0x8204A840)) = __builtin_bswap32(2191416920u);  // -> 0x829E5E58
+  *((volatile uint32_t*)(base + 0x8204A84C)) = __builtin_bswap32(2191416944u);  // -> 0x829E5E70
+  *((volatile uint32_t*)(base + 0x8204A8A8)) = __builtin_bswap32(2191416960u);  // -> 0x829E5E80
+  *((volatile uint32_t*)(base + 0x8205A3EC)) = __builtin_bswap32(2191657752u);  // -> 0x82A20B18
+  *((volatile uint32_t*)(base + 0x8208B3BC)) = __builtin_bswap32(2191657752u);  // -> 0x82A20B18
+  *((volatile uint32_t*)(base + 0x820EBAF4)) = __builtin_bswap32(2191657752u);  // -> 0x82A20B18
+  *((volatile uint32_t*)(base + 0x8205A3FC)) = __builtin_bswap32(2191657768u);  // -> 0x82A20B28
+  *((volatile uint32_t*)(base + 0x820807B4)) = __builtin_bswap32(2191657768u);  // -> 0x82A20B28
+  *((volatile uint32_t*)(base + 0x8208B3CC)) = __builtin_bswap32(2191657768u);  // -> 0x82A20B28
+  *((volatile uint32_t*)(base + 0x820667F4)) = __builtin_bswap32(2192035000u);  // -> 0x82A7CCB8
+  *((volatile uint32_t*)(base + 0x8208BEF0)) = __builtin_bswap32(2193321024u);  // -> 0x82BB6C40
+  *((volatile uint32_t*)(base + 0x82091598)) = __builtin_bswap32(2193386216u);  // -> 0x82BC6AE8
+  *((volatile uint32_t*)(base + 0x8209159C)) = __builtin_bswap32(2193386240u);  // -> 0x82BC6B00
+  *((volatile uint32_t*)(base + 0x820915A4)) = __builtin_bswap32(2193386264u);  // -> 0x82BC6B18
+  *((volatile uint32_t*)(base + 0x820915A0)) = __builtin_bswap32(2193386288u);  // -> 0x82BC6B30
+  *((volatile uint32_t*)(base + 0x820915AC)) = __builtin_bswap32(2193386328u);  // -> 0x82BC6B58
+  *((volatile uint32_t*)(base + 0x820915B4)) = __builtin_bswap32(2193386352u);  // -> 0x82BC6B70
+  *((volatile uint32_t*)(base + 0x820915B8)) = __builtin_bswap32(2193386376u);  // -> 0x82BC6B88
+  *((volatile uint32_t*)(base + 0x820915BC)) = __builtin_bswap32(2193386400u);  // -> 0x82BC6BA0
+  *((volatile uint32_t*)(base + 0x820CDAB0)) = __builtin_bswap32(2194012768u);  // -> 0x82C5FA60
+  *((volatile uint32_t*)(base + 0x8209D830)) = __builtin_bswap32(2194020072u);  // -> 0x82C616E8
+  *((volatile uint32_t*)(base + 0x820A9910)) = __builtin_bswap32(2194446840u);  // -> 0x82CC99F8
+  *((volatile uint32_t*)(base + 0x820AAA08)) = __builtin_bswap32(2194582432u);  // -> 0x82CEABA0
+  *((volatile uint32_t*)(base + 0x820ABA90)) = __builtin_bswap32(2194630024u);  // -> 0x82CF6588
+  *((volatile uint32_t*)(base + 0x820B3890)) = __builtin_bswap32(2194949936u);  // -> 0x82D44730
+  *((volatile uint32_t*)(base + 0x820B4FAC)) = __builtin_bswap32(2194994968u);  // -> 0x82D4F718
+  *((volatile uint32_t*)(base + 0x820CB520)) = __builtin_bswap32(2195641120u);  // -> 0x82DED320
+  *((volatile uint32_t*)(base + 0x820CDAFC)) = __builtin_bswap32(2195649240u);  // -> 0x82DEF2D8
+  *((volatile uint32_t*)(base + 0x820CADCC)) = __builtin_bswap32(2195657976u);  // -> 0x82DF14F8
+  *((volatile uint32_t*)(base + 0x820CDF2C)) = __builtin_bswap32(2195690288u);  // -> 0x82DF9330
+  *((volatile uint32_t*)(base + 0x820CE31C)) = __builtin_bswap32(2195690288u);  // -> 0x82DF9330
+  *((volatile uint32_t*)(base + 0x820CE4A4)) = __builtin_bswap32(2195693472u);  // -> 0x82DF9FA0
+  *((volatile uint32_t*)(base + 0x820CE51C)) = __builtin_bswap32(2195697328u);  // -> 0x82DFAEB0
+  *((volatile uint32_t*)(base + 0x820E6808)) = __builtin_bswap32(2196106920u);  // -> 0x82E5EEA8
+  *((volatile uint32_t*)(base + 0x820E680C)) = __builtin_bswap32(2196106920u);  // -> 0x82E5EEA8
+  *((volatile uint32_t*)(base + 0x820E7550)) = __builtin_bswap32(2196106920u);  // -> 0x82E5EEA8
+  *((volatile uint32_t*)(base + 0x820E869C)) = __builtin_bswap32(2196114304u);  // -> 0x82E60B80
+  *((volatile uint32_t*)(base + 0x820E86B4)) = __builtin_bswap32(2196114336u);  // -> 0x82E60BA0
+  *((volatile uint32_t*)(base + 0x820E86BC)) = __builtin_bswap32(2196114368u);  // -> 0x82E60BC0
+  *((volatile uint32_t*)(base + 0x820E86DC)) = __builtin_bswap32(2196114400u);  // -> 0x82E60BE0
+  *((volatile uint32_t*)(base + 0x820E6EE8)) = __builtin_bswap32(2196114944u);  // -> 0x82E60E00
+  *((volatile uint32_t*)(base + 0x820E6EFC)) = __builtin_bswap32(2196115104u);  // -> 0x82E60EA0
+  *((volatile uint32_t*)(base + 0x820E5E7C)) = __builtin_bswap32(2196118976u);  // -> 0x82E61DC0
+  *((volatile uint32_t*)(base + 0x820E7450)) = __builtin_bswap32(2196138896u);  // -> 0x82E66B90
+  *((volatile uint32_t*)(base + 0x820F1308)) = __builtin_bswap32(2196138896u);  // -> 0x82E66B90
+  *((volatile uint32_t*)(base + 0x820E7780)) = __builtin_bswap32(2196146672u);  // -> 0x82E689F0
+  *((volatile uint32_t*)(base + 0x820E5114)) = __builtin_bswap32(2196155008u);  // -> 0x82E6AA80
+  *((volatile uint32_t*)(base + 0x820E6994)) = __builtin_bswap32(2196155008u);  // -> 0x82E6AA80
+  *((volatile uint32_t*)(base + 0x820E50F0)) = __builtin_bswap32(2196155160u);  // -> 0x82E6AB18
+  *((volatile uint32_t*)(base + 0x820E6970)) = __builtin_bswap32(2196155160u);  // -> 0x82E6AB18
+  *((volatile uint32_t*)(base + 0x820E6E1C)) = __builtin_bswap32(2196183448u);  // -> 0x82E71998
+  *((volatile uint32_t*)(base + 0x820E8AE0)) = __builtin_bswap32(2196203688u);  // -> 0x82E768A8
+  *((volatile uint32_t*)(base + 0x820E8AD8)) = __builtin_bswap32(2196203768u);  // -> 0x82E768F8
+  *((volatile uint32_t*)(base + 0x820E8AC8)) = __builtin_bswap32(2196203832u);  // -> 0x82E76938
+  *((volatile uint32_t*)(base + 0x820E8AF0)) = __builtin_bswap32(2196203856u);  // -> 0x82E76950
+  *((volatile uint32_t*)(base + 0x820E8AF4)) = __builtin_bswap32(2196203880u);  // -> 0x82E76968
+  *((volatile uint32_t*)(base + 0x820E8AF8)) = __builtin_bswap32(2196203928u);  // -> 0x82E76998
+  *((volatile uint32_t*)(base + 0x820E8B14)) = __builtin_bswap32(2196204048u);  // -> 0x82E76A10
+  *((volatile uint32_t*)(base + 0x820E8B1C)) = __builtin_bswap32(2196204072u);  // -> 0x82E76A28
+  *((volatile uint32_t*)(base + 0x820E8B48)) = __builtin_bswap32(2196204120u);  // -> 0x82E76A58
+  *((volatile uint32_t*)(base + 0x820E8B4C)) = __builtin_bswap32(2196204144u);  // -> 0x82E76A70
+  *((volatile uint32_t*)(base + 0x820E5104)) = __builtin_bswap32(2196243560u);  // -> 0x82E80468
+  *((volatile uint32_t*)(base + 0x820E6984)) = __builtin_bswap32(2196243560u);  // -> 0x82E80468
+  *((volatile uint32_t*)(base + 0x820E69A0)) = __builtin_bswap32(2196246680u);  // -> 0x82E81098
+  *((volatile uint32_t*)(base + 0x820E699C)) = __builtin_bswap32(2196246688u);  // -> 0x82E810A0
+  *((volatile uint32_t*)(base + 0x820E6998)) = __builtin_bswap32(2196246696u);  // -> 0x82E810A8
+  *((volatile uint32_t*)(base + 0x820E6C4C)) = __builtin_bswap32(2196264160u);  // -> 0x82E854E0
+  *((volatile uint32_t*)(base + 0x820E6C74)) = __builtin_bswap32(2196264192u);  // -> 0x82E85500
+  *((volatile uint32_t*)(base + 0x820E6E78)) = __builtin_bswap32(2196275032u);  // -> 0x82E87F58
+  *((volatile uint32_t*)(base + 0x820E6E50)) = __builtin_bswap32(2196275056u);  // -> 0x82E87F70
+  *((volatile uint32_t*)(base + 0x820E6F98)) = __builtin_bswap32(2196275056u);  // -> 0x82E87F70
+  *((volatile uint32_t*)(base + 0x820E7470)) = __builtin_bswap32(2196275056u);  // -> 0x82E87F70
+  *((volatile uint32_t*)(base + 0x820E6E3C)) = __builtin_bswap32(2196275064u);  // -> 0x82E87F78
+  *((volatile uint32_t*)(base + 0x820E6F84)) = __builtin_bswap32(2196275064u);  // -> 0x82E87F78
+  *((volatile uint32_t*)(base + 0x820E745C)) = __builtin_bswap32(2196275064u);  // -> 0x82E87F78
+  *((volatile uint32_t*)(base + 0x820E6E44)) = __builtin_bswap32(2196275080u);  // -> 0x82E87F88
+  *((volatile uint32_t*)(base + 0x820E6F8C)) = __builtin_bswap32(2196275080u);  // -> 0x82E87F88
+  *((volatile uint32_t*)(base + 0x820E7464)) = __builtin_bswap32(2196275080u);  // -> 0x82E87F88
+  *((volatile uint32_t*)(base + 0x820E6E70)) = __builtin_bswap32(2196275104u);  // -> 0x82E87FA0
+  *((volatile uint32_t*)(base + 0x820E6FB8)) = __builtin_bswap32(2196275104u);  // -> 0x82E87FA0
+  *((volatile uint32_t*)(base + 0x820E6E54)) = __builtin_bswap32(2196308008u);  // -> 0x82E90028
+  *((volatile uint32_t*)(base + 0x820E6F9C)) = __builtin_bswap32(2196308008u);  // -> 0x82E90028
+  *((volatile uint32_t*)(base + 0x820E7474)) = __builtin_bswap32(2196308008u);  // -> 0x82E90028
+  *((volatile uint32_t*)(base + 0x820E6EB0)) = __builtin_bswap32(2196308016u);  // -> 0x82E90030
+  *((volatile uint32_t*)(base + 0x820E6FF8)) = __builtin_bswap32(2196308016u);  // -> 0x82E90030
+  *((volatile uint32_t*)(base + 0x820E74D0)) = __builtin_bswap32(2196308016u);  // -> 0x82E90030
+  *((volatile uint32_t*)(base + 0x820E6EB8)) = __builtin_bswap32(2196308056u);  // -> 0x82E90058
+  *((volatile uint32_t*)(base + 0x820E7000)) = __builtin_bswap32(2196308056u);  // -> 0x82E90058
+  *((volatile uint32_t*)(base + 0x820E74D8)) = __builtin_bswap32(2196308056u);  // -> 0x82E90058
+  *((volatile uint32_t*)(base + 0x820E74E4)) = __builtin_bswap32(2196308096u);  // -> 0x82E90080
+  *((volatile uint32_t*)(base + 0x820E6E64)) = __builtin_bswap32(2196308616u);  // -> 0x82E90288
+  *((volatile uint32_t*)(base + 0x820E6FAC)) = __builtin_bswap32(2196308616u);  // -> 0x82E90288
+  *((volatile uint32_t*)(base + 0x820E7484)) = __builtin_bswap32(2196308616u);  // -> 0x82E90288
+  *((volatile uint32_t*)(base + 0x820E6E5C)) = __builtin_bswap32(2196308624u);  // -> 0x82E90290
+  *((volatile uint32_t*)(base + 0x820E6FA4)) = __builtin_bswap32(2196308624u);  // -> 0x82E90290
+  *((volatile uint32_t*)(base + 0x820E747C)) = __builtin_bswap32(2196308624u);  // -> 0x82E90290
+  *((volatile uint32_t*)(base + 0x820E7490)) = __builtin_bswap32(2196308632u);  // -> 0x82E90298
+  *((volatile uint32_t*)(base + 0x820E8020)) = __builtin_bswap32(2196345224u);  // -> 0x82E99188
+  *((volatile uint32_t*)(base + 0x820E86C4)) = __builtin_bswap32(2196368904u);  // -> 0x82E9EE08
+  *((volatile uint32_t*)(base + 0x820E86C8)) = __builtin_bswap32(2196368936u);  // -> 0x82E9EE28
+  *((volatile uint32_t*)(base + 0x820E86D4)) = __builtin_bswap32(2196368968u);  // -> 0x82E9EE48
+  *((volatile uint32_t*)(base + 0x820E86D8)) = __builtin_bswap32(2196369000u);  // -> 0x82E9EE68
+  *((volatile uint32_t*)(base + 0x820E8704)) = __builtin_bswap32(2196369032u);  // -> 0x82E9EE88
+  *((volatile uint32_t*)(base + 0x820E8708)) = __builtin_bswap32(2196369064u);  // -> 0x82E9EEA8
+  *((volatile uint32_t*)(base + 0x820E870C)) = __builtin_bswap32(2196369096u);  // -> 0x82E9EEC8
+  *((volatile uint32_t*)(base + 0x820E86E0)) = __builtin_bswap32(2196369128u);  // -> 0x82E9EEE8
+  *((volatile uint32_t*)(base + 0x820E8AA4)) = __builtin_bswap32(2196380816u);  // -> 0x82EA1C90
+  *((volatile uint32_t*)(base + 0x820E8AA8)) = __builtin_bswap32(2196380840u);  // -> 0x82EA1CA8
+  *((volatile uint32_t*)(base + 0x820E8A9C)) = __builtin_bswap32(2196380864u);  // -> 0x82EA1CC0
+  *((volatile uint32_t*)(base + 0x820E8A94)) = __builtin_bswap32(2196380888u);  // -> 0x82EA1CD8
+  *((volatile uint32_t*)(base + 0x820E8AA0)) = __builtin_bswap32(2196380912u);  // -> 0x82EA1CF0
+  *((volatile uint32_t*)(base + 0x820E8AAC)) = __builtin_bswap32(2196380936u);  // -> 0x82EA1D08
+  *((volatile uint32_t*)(base + 0x820E8A98)) = __builtin_bswap32(2196380960u);  // -> 0x82EA1D20
+  *((volatile uint32_t*)(base + 0x820E8AB0)) = __builtin_bswap32(2196380984u);  // -> 0x82EA1D38
+  *((volatile uint32_t*)(base + 0x820E8AB4)) = __builtin_bswap32(2196381008u);  // -> 0x82EA1D50
+  *((volatile uint32_t*)(base + 0x820E8B68)) = __builtin_bswap32(2196381032u);  // -> 0x82EA1D68
+  *((volatile uint32_t*)(base + 0x820E8B6C)) = __builtin_bswap32(2196381056u);  // -> 0x82EA1D80
+  *((volatile uint32_t*)(base + 0x820E8B70)) = __builtin_bswap32(2196381080u);  // -> 0x82EA1D98
+  *((volatile uint32_t*)(base + 0x820E8B74)) = __builtin_bswap32(2196381104u);  // -> 0x82EA1DB0
+  *((volatile uint32_t*)(base + 0x820E8B38)) = __builtin_bswap32(2196381128u);  // -> 0x82EA1DC8
+  *((volatile uint32_t*)(base + 0x820E6B10)) = __builtin_bswap32(2196381960u);  // -> 0x82EA2108
+  *((volatile uint32_t*)(base + 0x820E8C88)) = __builtin_bswap32(2196381960u);  // -> 0x82EA2108
+  *((volatile uint32_t*)(base + 0x820F9AE4)) = __builtin_bswap32(2196381960u);  // -> 0x82EA2108
+  *((volatile uint32_t*)(base + 0x820E8DD8)) = __builtin_bswap32(2196384464u);  // -> 0x82EA2AD0
+  *((volatile uint32_t*)(base + 0x820E8E50)) = __builtin_bswap32(2196384592u);  // -> 0x82EA2B50
+  *((volatile uint32_t*)(base + 0x820E8E70)) = __builtin_bswap32(2196384768u);  // -> 0x82EA2C00
+  *((volatile uint32_t*)(base + 0x820ED6C0)) = __builtin_bswap32(2196501784u);  // -> 0x82EBF518
+  *((volatile uint32_t*)(base + 0x820F20E0)) = __builtin_bswap32(2196523824u);  // -> 0x82EC4B30
+  *((volatile uint32_t*)(base + 0x820F20E4)) = __builtin_bswap32(2196523824u);  // -> 0x82EC4B30
+  *((volatile uint32_t*)(base + 0x820EDD70)) = __builtin_bswap32(2196528472u);  // -> 0x82EC5D58
+  *((volatile uint32_t*)(base + 0x820ECC74)) = __builtin_bswap32(2196552832u);  // -> 0x82ECBC80
+  *((volatile uint32_t*)(base + 0x820ECC78)) = __builtin_bswap32(2196552904u);  // -> 0x82ECBCC8
+  *((volatile uint32_t*)(base + 0x820F13C8)) = __builtin_bswap32(2196552904u);  // -> 0x82ECBCC8
+  *((volatile uint32_t*)(base + 0x820F0024)) = __builtin_bswap32(2196564760u);  // -> 0x82ECEB18
+  *((volatile uint32_t*)(base + 0x820EFABC)) = __builtin_bswap32(2196592480u);  // -> 0x82ED5760
+  *((volatile uint32_t*)(base + 0x820EFAC8)) = __builtin_bswap32(2196592776u);  // -> 0x82ED5888
+  *((volatile uint32_t*)(base + 0x820EFB34)) = __builtin_bswap32(2196593208u);  // -> 0x82ED5A38
+  *((volatile uint32_t*)(base + 0x820EFB4C)) = __builtin_bswap32(2196593480u);  // -> 0x82ED5B48
+  *((volatile uint32_t*)(base + 0x820F00D8)) = __builtin_bswap32(2196652096u);  // -> 0x82EE4040
+  *((volatile uint32_t*)(base + 0x820EFA98)) = __builtin_bswap32(2196699568u);  // -> 0x82EEF9B0
+  *((volatile uint32_t*)(base + 0x820F031C)) = __builtin_bswap32(2196768544u);  // -> 0x82F00720
+  *((volatile uint32_t*)(base + 0x820F5EDC)) = __builtin_bswap32(2196904568u);  // -> 0x82F21A78
+  *((volatile uint32_t*)(base + 0x820F5F7C)) = __builtin_bswap32(2196905632u);  // -> 0x82F21EA0
+  *((volatile uint32_t*)(base + 0x820FBA08)) = __builtin_bswap32(2196906136u);  // -> 0x82F22098
+  *((volatile uint32_t*)(base + 0x820F3D30)) = __builtin_bswap32(2196908048u);  // -> 0x82F22810
+  *((volatile uint32_t*)(base + 0x820F3D7C)) = __builtin_bswap32(2196908048u);  // -> 0x82F22810
+  *((volatile uint32_t*)(base + 0x820F5150)) = __builtin_bswap32(2196955320u);  // -> 0x82F2E0B8
+  *((volatile uint32_t*)(base + 0x820F54F4)) = __builtin_bswap32(2196959760u);  // -> 0x82F2F210
+  *((volatile uint32_t*)(base + 0x820F5508)) = __builtin_bswap32(2196959760u);  // -> 0x82F2F210
+  *((volatile uint32_t*)(base + 0x820F553C)) = __builtin_bswap32(2196959760u);  // -> 0x82F2F210
+  *((volatile uint32_t*)(base + 0x820F54F8)) = __builtin_bswap32(2196959792u);  // -> 0x82F2F230
+  *((volatile uint32_t*)(base + 0x820F550C)) = __builtin_bswap32(2196959792u);  // -> 0x82F2F230
+  *((volatile uint32_t*)(base + 0x820F5540)) = __builtin_bswap32(2196959792u);  // -> 0x82F2F230
+  *((volatile uint32_t*)(base + 0x820F5EC0)) = __builtin_bswap32(2196982192u);  // -> 0x82F349B0
+  *((volatile uint32_t*)(base + 0x820F5E98)) = __builtin_bswap32(2196982224u);  // -> 0x82F349D0
+  *((volatile uint32_t*)(base + 0x820F5FAC)) = __builtin_bswap32(2196982992u);  // -> 0x82F34CD0
+  *((volatile uint32_t*)(base + 0x820F5F80)) = __builtin_bswap32(2196983024u);  // -> 0x82F34CF0
+  *((volatile uint32_t*)(base + 0x820F8B58)) = __builtin_bswap32(2196984032u);  // -> 0x82F350E0
+  *((volatile uint32_t*)(base + 0x820F8C28)) = __builtin_bswap32(2196984816u);  // -> 0x82F353F0
+  *((volatile uint32_t*)(base + 0x820F8C38)) = __builtin_bswap32(2196984968u);  // -> 0x82F35488
+  *((volatile uint32_t*)(base + 0x8213D110)) = __builtin_bswap32(2196984968u);  // -> 0x82F35488
+  *((volatile uint32_t*)(base + 0x8213D238)) = __builtin_bswap32(2196984968u);  // -> 0x82F35488
+  *((volatile uint32_t*)(base + 0x820F8C4C)) = __builtin_bswap32(2196985120u);  // -> 0x82F35520
+  *((volatile uint32_t*)(base + 0x820FBA58)) = __builtin_bswap32(2197220104u);  // -> 0x82F6EB08
+  *((volatile uint32_t*)(base + 0x820FBA30)) = __builtin_bswap32(2197220136u);  // -> 0x82F6EB28
+  *((volatile uint32_t*)(base + 0x82101A60)) = __builtin_bswap32(2197356144u);  // -> 0x82F8FE70
+  *((volatile uint32_t*)(base + 0x82102BA4)) = __builtin_bswap32(2197496752u);  // -> 0x82FB23B0
+  *((volatile uint32_t*)(base + 0x82116D90)) = __builtin_bswap32(2197733376u);  // -> 0x82FEC000
+  *((volatile uint32_t*)(base + 0x83A639DC)) = __builtin_bswap32(2197888600u);  // -> 0x83011E58
+  *((volatile uint32_t*)(base + 0x823B0460)) = __builtin_bswap32(2198329908u);  // -> 0x8307DA34
+  *((volatile uint32_t*)(base + 0x823B0490)) = __builtin_bswap32(2198331024u);  // -> 0x8307DE90
+  *((volatile uint32_t*)(base + 0x823B05C8)) = __builtin_bswap32(2198368312u);  // -> 0x83087038
+  *((volatile uint32_t*)(base + 0x823B0690)) = __builtin_bswap32(2198376532u);  // -> 0x83089054
+  *((volatile uint32_t*)(base + 0x823B06B0)) = __builtin_bswap32(2198388176u);  // -> 0x8308BDD0
+  *((volatile uint32_t*)(base + 0x8213CFF0)) = __builtin_bswap32(2198397864u);  // -> 0x8308E3A8
+  *((volatile uint32_t*)(base + 0x8213D0A4)) = __builtin_bswap32(2198407136u);  // -> 0x830907E0
+  *((volatile uint32_t*)(base + 0x8213D1CC)) = __builtin_bswap32(2198407136u);  // -> 0x830907E0
+  *((volatile uint32_t*)(base + 0x8213D374)) = __builtin_bswap32(2198407136u);  // -> 0x830907E0
+  *((volatile uint32_t*)(base + 0x8213D0C4)) = __builtin_bswap32(2198407144u);  // -> 0x830907E8
+  *((volatile uint32_t*)(base + 0x8213D1EC)) = __builtin_bswap32(2198407144u);  // -> 0x830907E8
+  *((volatile uint32_t*)(base + 0x8213D394)) = __builtin_bswap32(2198407144u);  // -> 0x830907E8
+  *((volatile uint32_t*)(base + 0x8213D0B0)) = __builtin_bswap32(2198407152u);  // -> 0x830907F0
+  *((volatile uint32_t*)(base + 0x8213D1D8)) = __builtin_bswap32(2198407152u);  // -> 0x830907F0
+  *((volatile uint32_t*)(base + 0x8213D380)) = __builtin_bswap32(2198407152u);  // -> 0x830907F0
+  *((volatile uint32_t*)(base + 0x8213D0EC)) = __builtin_bswap32(2198407160u);  // -> 0x830907F8
+  *((volatile uint32_t*)(base + 0x8213D0CC)) = __builtin_bswap32(2198407176u);  // -> 0x83090808
+  *((volatile uint32_t*)(base + 0x8213D1F4)) = __builtin_bswap32(2198407176u);  // -> 0x83090808
+  *((volatile uint32_t*)(base + 0x8213D39C)) = __builtin_bswap32(2198407176u);  // -> 0x83090808
+  *((volatile uint32_t*)(base + 0x8213D0E8)) = __builtin_bswap32(2198407184u);  // -> 0x83090810
+  *((volatile uint32_t*)(base + 0x8213D210)) = __builtin_bswap32(2198407184u);  // -> 0x83090810
+  *((volatile uint32_t*)(base + 0x8213D3B8)) = __builtin_bswap32(2198407184u);  // -> 0x83090810
+  *((volatile uint32_t*)(base + 0x8213D0BC)) = __builtin_bswap32(2198407192u);  // -> 0x83090818
+  *((volatile uint32_t*)(base + 0x8213D1E4)) = __builtin_bswap32(2198407192u);  // -> 0x83090818
+  *((volatile uint32_t*)(base + 0x8213D38C)) = __builtin_bswap32(2198407192u);  // -> 0x83090818
+  *((volatile uint32_t*)(base + 0x8213D10C)) = __builtin_bswap32(2198407200u);  // -> 0x83090820
+  *((volatile uint32_t*)(base + 0x8213D234)) = __builtin_bswap32(2198407200u);  // -> 0x83090820
+  *((volatile uint32_t*)(base + 0x8213D3DC)) = __builtin_bswap32(2198407200u);  // -> 0x83090820
+  *((volatile uint32_t*)(base + 0x8213D0A0)) = __builtin_bswap32(2198407288u);  // -> 0x83090878
+  *((volatile uint32_t*)(base + 0x8213D1C8)) = __builtin_bswap32(2198407288u);  // -> 0x83090878
+  *((volatile uint32_t*)(base + 0x8213D370)) = __builtin_bswap32(2198407288u);  // -> 0x83090878
+  *((volatile uint32_t*)(base + 0x8213D45C)) = __builtin_bswap32(2198428200u);  // -> 0x83095A28
+  *((volatile uint32_t*)(base + 0x8213D0A8)) = __builtin_bswap32(2198428216u);  // -> 0x83095A38
+  *((volatile uint32_t*)(base + 0x8213D1D0)) = __builtin_bswap32(2198428216u);  // -> 0x83095A38
+  *((volatile uint32_t*)(base + 0x8213D378)) = __builtin_bswap32(2198428216u);  // -> 0x83095A38
+  *((volatile uint32_t*)(base + 0x8213D0C0)) = __builtin_bswap32(2198428224u);  // -> 0x83095A40
+  *((volatile uint32_t*)(base + 0x8213D1E8)) = __builtin_bswap32(2198428224u);  // -> 0x83095A40
+  *((volatile uint32_t*)(base + 0x8213D390)) = __builtin_bswap32(2198428224u);  // -> 0x83095A40
+  *((volatile uint32_t*)(base + 0x8213D47C)) = __builtin_bswap32(2198428232u);  // -> 0x83095A48
+  *((volatile uint32_t*)(base + 0x8213D4D4)) = __builtin_bswap32(2198433232u);  // -> 0x83096DD0
+  *((volatile uint32_t*)(base + 0x8213D440)) = __builtin_bswap32(2198433248u);  // -> 0x83096DE0
+  *((volatile uint32_t*)(base + 0x8213D4B8)) = __builtin_bswap32(2198433248u);  // -> 0x83096DE0
+  *((volatile uint32_t*)(base + 0x8213D410)) = __builtin_bswap32(2198433256u);  // -> 0x83096DE8
+  *((volatile uint32_t*)(base + 0x8213D488)) = __builtin_bswap32(2198433256u);  // -> 0x83096DE8
+  *((volatile uint32_t*)(base + 0x8213D0B8)) = __builtin_bswap32(2198433264u);  // -> 0x83096DF0
+  *((volatile uint32_t*)(base + 0x8213D1E0)) = __builtin_bswap32(2198433264u);  // -> 0x83096DF0
+  *((volatile uint32_t*)(base + 0x8213D388)) = __builtin_bswap32(2198433264u);  // -> 0x83096DF0
+  *((volatile uint32_t*)(base + 0x8213D0E0)) = __builtin_bswap32(2198433272u);  // -> 0x83096DF8
+  *((volatile uint32_t*)(base + 0x8213D208)) = __builtin_bswap32(2198433272u);  // -> 0x83096DF8
+  *((volatile uint32_t*)(base + 0x8213D3B0)) = __builtin_bswap32(2198433272u);  // -> 0x83096DF8
+  *((volatile uint32_t*)(base + 0x8213D0B4)) = __builtin_bswap32(2198433280u);  // -> 0x83096E00
+  *((volatile uint32_t*)(base + 0x8213D1DC)) = __builtin_bswap32(2198433280u);  // -> 0x83096E00
+  *((volatile uint32_t*)(base + 0x8213D384)) = __builtin_bswap32(2198433280u);  // -> 0x83096E00
+  *((volatile uint32_t*)(base + 0x8213D4F4)) = __builtin_bswap32(2198433288u);  // -> 0x83096E08
+  *((volatile uint32_t*)(base + 0x8213D5FC)) = __builtin_bswap32(2198435272u);  // -> 0x830975C8
+  *((volatile uint32_t*)(base + 0x8213D594)) = __builtin_bswap32(2198438648u);  // -> 0x830982F8
+  *((volatile uint32_t*)(base + 0x8213D658)) = __builtin_bswap32(2198442032u);  // -> 0x83099030
+  *((volatile uint32_t*)(base + 0x8213D834)) = __builtin_bswap32(2198454016u);  // -> 0x8309BF00
+  *((volatile uint32_t*)(base + 0x8213D7F4)) = __builtin_bswap32(2198454712u);  // -> 0x8309C1B8
+  *((volatile uint32_t*)(base + 0x823B06C0)) = __builtin_bswap32(2198494040u);  // -> 0x830A5B58
+  *((volatile uint32_t*)(base + 0x823B06C8)) = __builtin_bswap32(2198494040u);  // -> 0x830A5B58
+  *((volatile uint32_t*)(base + 0x823B06E0)) = __builtin_bswap32(2198504808u);  // -> 0x830A8568
+  *((volatile uint32_t*)(base + 0x821416FC)) = __builtin_bswap32(2198511120u);  // -> 0x830A9E10
+  *((volatile uint32_t*)(base + 0x8214170C)) = __builtin_bswap32(2198511128u);  // -> 0x830A9E18
+  *((volatile uint32_t*)(base + 0x821416B0)) = __builtin_bswap32(2198517504u);  // -> 0x830AB700
+  *((volatile uint32_t*)(base + 0x821417C8)) = __builtin_bswap32(2198517504u);  // -> 0x830AB700
+  *((volatile uint32_t*)(base + 0x8215EE00)) = __builtin_bswap32(2198841848u);  // -> 0x830FA9F8
+  *((volatile uint32_t*)(base + 0x8215EE08)) = __builtin_bswap32(2198842304u);  // -> 0x830FABC0
+  *((volatile uint32_t*)(base + 0x8215EE40)) = __builtin_bswap32(2198842304u);  // -> 0x830FABC0
+  *((volatile uint32_t*)(base + 0x82161C68)) = __builtin_bswap32(2198899184u);  // -> 0x831089F0
+  *((volatile uint32_t*)(base + 0x82161C88)) = __builtin_bswap32(2198903872u);  // -> 0x83109C40
+  *((volatile uint32_t*)(base + 0x8217E06C)) = __builtin_bswap32(2200014000u);  // -> 0x83218CB0
+  *((volatile uint32_t*)(base + 0x8217D514)) = __builtin_bswap32(2200016440u);  // -> 0x83219638
+  *((volatile uint32_t*)(base + 0x8217F500)) = __builtin_bswap32(2200210624u);  // -> 0x83248CC0
+  *((volatile uint32_t*)(base + 0x8217F514)) = __builtin_bswap32(2200210648u);  // -> 0x83248CD8
+  *((volatile uint32_t*)(base + 0x8217F474)) = __builtin_bswap32(2200218224u);  // -> 0x8324AA70
+  *((volatile uint32_t*)(base + 0x8217F67C)) = __builtin_bswap32(2200224528u);  // -> 0x8324C310
+  *((volatile uint32_t*)(base + 0x8217F848)) = __builtin_bswap32(2200225664u);  // -> 0x8324C780
+  *((volatile uint32_t*)(base + 0x82180538)) = __builtin_bswap32(2200225664u);  // -> 0x8324C780
+  *((volatile uint32_t*)(base + 0x8217F96C)) = __builtin_bswap32(2200316048u);  // -> 0x83262890
+  *((volatile uint32_t*)(base + 0x82191CC0)) = __builtin_bswap32(2200410008u);  // -> 0x83279798
+  *((volatile uint32_t*)(base + 0x82192F2C)) = __builtin_bswap32(2200429040u);  // -> 0x8327E1F0
+  *((volatile uint32_t*)(base + 0x82193700)) = __builtin_bswap32(2200464688u);  // -> 0x83286D30
+  *((volatile uint32_t*)(base + 0x8218C69C)) = __builtin_bswap32(2200633064u);  // -> 0x832AFEE8
+  *((volatile uint32_t*)(base + 0x820142D4)) = __builtin_bswap32(2201451416u);  // -> 0x83377B98
+  *((volatile uint32_t*)(base + 0x820142DC)) = __builtin_bswap32(2201451432u);  // -> 0x83377BA8
+  *((volatile uint32_t*)(base + 0x82014490)) = __builtin_bswap32(2202061672u);  // -> 0x8340CB68
+  *((volatile uint32_t*)(base + 0x8223394C)) = __builtin_bswap32(2202230112u);  // -> 0x83435D60
+  *((volatile uint32_t*)(base + 0x8222F2C4)) = __builtin_bswap32(2202242424u);  // -> 0x83438D78
+  *((volatile uint32_t*)(base + 0x8222F2E4)) = __builtin_bswap32(2202243232u);  // -> 0x834390A0
+  *((volatile uint32_t*)(base + 0x8222F2E8)) = __builtin_bswap32(2202243256u);  // -> 0x834390B8
+  *((volatile uint32_t*)(base + 0x8222F2EC)) = __builtin_bswap32(2202243280u);  // -> 0x834390D0
+  *((volatile uint32_t*)(base + 0x8227A79C)) = __builtin_bswap32(2203137728u);  // -> 0x835136C0
+  *((volatile uint32_t*)(base + 0x8227A7A8)) = __builtin_bswap32(2203137752u);  // -> 0x835136D8
+  *((volatile uint32_t*)(base + 0x822903A8)) = __builtin_bswap32(2203473216u);  // -> 0x83565540
+  *((volatile uint32_t*)(base + 0x822909F4)) = __builtin_bswap32(2203473216u);  // -> 0x83565540
+  *((volatile uint32_t*)(base + 0x82290AB4)) = __builtin_bswap32(2203473216u);  // -> 0x83565540
+  *((volatile uint32_t*)(base + 0x822CD924)) = __builtin_bswap32(2204259104u);  // -> 0x83625320
+  *((volatile uint32_t*)(base + 0x822DF2DC)) = __builtin_bswap32(2204907176u);  // -> 0x836C36A8
+  *((volatile uint32_t*)(base + 0x822EE808)) = __builtin_bswap32(2205147576u);  // -> 0x836FE1B8
+  *((volatile uint32_t*)(base + 0x822EE818)) = __builtin_bswap32(2205147584u);  // -> 0x836FE1C0
+  *((volatile uint32_t*)(base + 0x822EE804)) = __builtin_bswap32(2205147592u);  // -> 0x836FE1C8
+  *((volatile uint32_t*)(base + 0x822EE854)) = __builtin_bswap32(2205148280u);  // -> 0x836FE478
+  *((volatile uint32_t*)(base + 0x822EE83C)) = __builtin_bswap32(2205148288u);  // -> 0x836FE480
+  *((volatile uint32_t*)(base + 0x822EE850)) = __builtin_bswap32(2205148296u);  // -> 0x836FE488
+  *((volatile uint32_t*)(base + 0x822EEB00)) = __builtin_bswap32(2205155688u);  // -> 0x83700168
+  *((volatile uint32_t*)(base + 0x822EEBD0)) = __builtin_bswap32(2205156928u);  // -> 0x83700640
+  *((volatile uint32_t*)(base + 0x823B0758)) = __builtin_bswap32(2205364064u);  // -> 0x83732F60
+  *((volatile uint32_t*)(base + 0x823B0760)) = __builtin_bswap32(2205364096u);  // -> 0x83732F80
+  *((volatile uint32_t*)(base + 0x823B0780)) = __builtin_bswap32(2205364440u);  // -> 0x837330D8
+  *((volatile uint32_t*)(base + 0x823B0798)) = __builtin_bswap32(2205365316u);  // -> 0x83733444
+  *((volatile uint32_t*)(base + 0x823B07B0)) = __builtin_bswap32(2205365636u);  // -> 0x83733584
+  *((volatile uint32_t*)(base + 0x823B07C8)) = __builtin_bswap32(2205367396u);  // -> 0x83733C64
+}

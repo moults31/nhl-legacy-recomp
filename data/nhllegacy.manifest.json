@@ -1,0 +1,58 @@
+[
+  {
+    "path": "boot.big",
+    "offset": 0,
+    "size": 11184432,
+    "uncompressed_size": 11184432,
+    "compression": "none",
+    "sha256": "6b4b88db2de4014d07875a9995abfc69a18ad4a2a80d6d96b981243a3d70a3dd"
+  },
+  {
+    "path": "renderboot.big",
+    "offset": 11184432,
+    "size": 9401248,
+    "uncompressed_size": 9401248,
+    "compression": "none",
+    "sha256": "72a6498007d645fa32443b84acfccdd9a8261baeba0a2890d24977796cd2a490"
+  },
+  {
+    "path": "audioboot.big",
+    "offset": 20585680,
+    "size": 1381808,
+    "uncompressed_size": 1381808,
+    "compression": "none",
+    "sha256": "37b89e918706b508bbdbb3716a5c165569152354dd3bdbdb07d90c297eaf6326"
+  },
+  {
+    "path": "audioboot2.big",
+    "offset": 21967488,
+    "size": 5635728,
+    "uncompressed_size": 5635728,
+    "compression": "none",
+    "sha256": "c21da26a48b23081cd92445d1878b5925a600fdb55e78afbc1b0aa900c2361ec"
+  },
+  {
+    "path": "data0.big",
+    "offset": 27603216,
+    "size": 29427680,
+    "uncompressed_size": 29427680,
+    "compression": "none",
+    "sha256": "7d4a441ad067e2df3ae71b32d8942903f766decbac693f655ef2fdfeff51b998"
+  },
+  {
+    "path": "cacheboot.big",
+    "offset": 57030896,
+    "size": 31705408,
+    "uncompressed_size": 31705408,
+    "compression": "none",
+    "sha256": "b558b4f6354b3f13bdedb499524c8068a488cd5a17d332f497d8c33bd782c989"
+  },
+  {
+    "path": "default.xex",
+    "offset": 88736304,
+    "size": 10448896,
+    "uncompressed_size": 10448896,
+    "compression": "none",
+    "sha256": "d818eb15775c1fee34b057b0fc494b211535d07123230ee45bd7d40991c55624"
+  }
+]

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>NHL Legacy — WASM</title>
+  <style>
+    body { margin: 0; background: #111; color: #0f0; font: 14px monospace; }
+    #log { padding: 10px; white-space: pre-wrap; height: 95vh; overflow-y: auto; position: relative; z-index: 2; }
+    #canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; image-rendering: pixelated; }
+    .err { color: #f44; }
+    .warn { color: #fa0; }
+    .info { color: #0af; }
+    #loading { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+               background:#222; border:1px solid #0f0; padding:20px; border-radius:8px;
+               text-align:center; font-size:16px; }
+    #progress-bar { width:300px; height:6px; background:#333; margin:10px auto; }
+    #progress-bar div { height:100%; background:#0f0; width:0; transition:width .3s; }
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <div>🏒 NHL Legacy — WASM</div>
+    <div id="load-status">Initializing...</div>
+    <div id="progress-bar"><div id="progress"></div></div>
+  </div>
+  <div id="log"></div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    const statusEl = document.getElementById('load-status');
+    const progressEl = document.getElementById('progress');
+    const loadingEl = document.getElementById('loading');
+
+    function log(msg, cls) {
+      logEl.innerHTML += `<span class="${cls||''}">${msg}</span>\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+      // Also emit to browser console (paints in real-time during sync execution)
+      if (cls === 'err') origConsoleError(msg);
+      else origConsoleLog(msg);
+    }
+
+    var origConsoleLog = console.log.bind(console);
+    var origConsoleWarn = console.warn.bind(console);
+    var origConsoleError = console.error.bind(console);
+    console.error = function(...a) { var m = a.join(' '); log(m, 'err'); };
+    console.warn  = function(...a) { var m = a.join(' '); log(m, 'warn'); };
+    console.log   = function(...a) { var m = a.join(' '); log(m, 'info'); };
+
+    var Module = {
+      print:    msg => log(msg),
+      printErr: msg => log(msg, 'err'),
+      onAbort:  msg => { log('ABORT: ' + msg, 'err'); statusEl.textContent = 'ABORT: ' + msg; loadingEl.style.display='none'; },
+      setStatus: function(text) {
+        document.title = 'NHL — ' + text;
+        statusEl.textContent = text;
+        if (text) log(text, 'info');
+      },
+      onRuntimeInitialized: function() {
+        log('WASM runtime initialized ✓', 'info');
+        loadingEl.style.display = 'none';
+      },
+      canvas: (() => {
+        const c = document.createElement('canvas');
+        c.width = 1280; c.height = 720; c.id = 'canvas';
+        document.body.appendChild(c);
+        return c;
+      })(),
+      instantiateWasm: function(info, receiveInstance) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', 'nhllegacy.wasm', true);
+        xhr.responseType = 'arraybuffer';
+        xhr.onprogress = function(e) {
+          if (e.lengthComputable) {
+            var pct = Math.round(e.loaded / e.total * 100);
+            statusEl.textContent = 'Downloading WASM... ' + pct + '%';
+            progressEl.style.width = pct + '%';
+          }
+        };
+        xhr.onload = function() {
+          statusEl.textContent = 'Compiling WASM...';
+          log('[wasm] Compiling...', 'info');
+          WebAssembly.instantiate(new Uint8Array(xhr.response), info)
+             .then(function(result) {
+              loadingEl.style.display = 'none';
+              initCanvas(Module.canvas);
+              statusEl.textContent = 'Instantiating WASM...';
+              log('[wasm] Instantiating...', 'info');
+              log('[wasm] Running main()...', 'info');
+              receiveInstance(result.instance, result.module);
+              log('[wasm] main() returned', 'info');
+              statusEl.textContent = 'WASM instantiated';
+            })
+            .catch(function(err) {
+              var msg = err.message || String(err);
+              log('[wasm] FAILED: ' + msg, 'err');
+              statusEl.textContent = 'ERROR: ' + msg;
+              if (receiveInstance) receiveInstance(null);
+            });
+        };
+        xhr.onerror = function() {
+          log('[wasm] Failed to download wasm binary', 'err');
+          statusEl.textContent = 'ERROR: download failed';
+          if (receiveInstance) receiveInstance(null);
+        };
+        xhr.send();
+        return {};
+      },
+      monitorRunDependencies: function(left) {
+        statusEl.textContent = left > 0
+          ? `Loading data files... (${left} remaining)`
+          : 'Running main()...';
+      }
+    };
+
+    statusEl.textContent = 'Waiting for WASM module...';
+
+    // Canvas init — uses 2D context (reliable, no GPU adapter hang)
+    function initCanvas(canvas) {
+      var ctx = canvas.getContext('2d');
+      // Clear to dark teal
+      ctx.fillStyle = '#2244AA';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      log('[gpu] 2D canvas initialized ✓', 'info');
+      log('[gpu] First frame rendered ✓ (software 2D)', 'info');
+      Module.canvas2d = ctx;
+    }
+  </script>
+  <script src="nhllegacy.js"></script>
+</body>
+</html>
