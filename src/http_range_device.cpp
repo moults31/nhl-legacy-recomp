@@ -114,63 +114,33 @@ void SkipJsonValue(const char*& p, const char* end) {
 // ============================================================================
 namespace {
 
-std::mutex             g_fetch_mx;
-std::condition_variable g_fetch_cv;
-bool                    g_fetch_done = false;
-emscripten_fetch_t*     g_fetch_result = nullptr;
-
-void OnFetchDone(emscripten_fetch_t* fetch) {
-    std::lock_guard<std::mutex> lk(g_fetch_mx);
-    g_fetch_done = true;
-    g_fetch_result = fetch;
-    g_fetch_cv.notify_one();
-}
-
 std::vector<uint8_t> FetchBlocking(const std::string& url,
                                    uint64_t range_start = 0,
                                    uint64_t range_end = 0) {
-    std::fprintf(stderr, "[vfs] FetchBlocking '%s' range=%llu-%llu\n", url.c_str(), range_start, range_end);
-    std::vector<uint8_t> result;
-    unsigned doRange = (range_end > range_start) ? 1u : 0u;
-    unsigned long long rstart = range_start;
-    unsigned long long rend = range_end;
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_attr_init(&attr);
+    std::strcpy(attr.requestMethod, "GET");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
+    attr.timeoutMSecs = 30000;
 
-    // Synchronous XHR — the fetch data is stored in Module._fetchBuf
-    // at a malloc'd address, with length in Module._fetchLen.
-    // This runs synchronously because XMLHttpRequest with sync=true
-    // blocks the main thread (allowed in single-threaded WASM).
-    EM_ASM({
-      try {
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', UTF8ToString($0), false); // false = synchronous
-        if ($1) xhr.setRequestHeader('Range',
-          'bytes=' + $2.toString() + '-' + ($3 - 1).toString());
-        xhr.responseType = 'arraybuffer';
-        xhr.send();
-        if (xhr.status === 200 || xhr.status === 206) {
-          var buf = new Uint8Array(xhr.response);
-          var ptr = _malloc(buf.length);
-          HEAPU8.set(buf, ptr);
-          Module._fetchPtr = ptr;
-          Module._fetchLen = buf.length;
-        } else {
-          Module._fetchPtr = 0;
-          Module._fetchLen = 0;
-        }
-      } catch (e) {
-        Module._fetchPtr = 0;
-        Module._fetchLen = 0;
-      }
-    }, url.c_str(), doRange, rstart, rend);
-
-    unsigned fetchLen = EM_ASM_INT({ return Module._fetchLen | 0; });
-    std::fprintf(stderr, "[vfs] FetchBlocking result: %u bytes\n", fetchLen);
-    if (fetchLen > 0) {
-      void* fetchPtr = reinterpret_cast<void*>(EM_ASM_PTR({ return Module._fetchPtr; }));
-      result.assign(static_cast<uint8_t*>(fetchPtr),
-                     static_cast<uint8_t*>(fetchPtr) + fetchLen);
-      free(fetchPtr);
+    std::string range_value;
+    const char* extra_hdrs[3] = {nullptr, nullptr, nullptr};
+    if (range_end > range_start) {
+        range_value = "bytes=" + std::to_string(range_start) + "-" +
+                      std::to_string(range_end - 1);
+        extra_hdrs[0] = "Range";
+        extra_hdrs[1] = range_value.c_str();
+        attr.requestHeaders = extra_hdrs;
     }
+
+    emscripten_fetch_t* fetch = emscripten_fetch(&attr, url.c_str());
+
+    std::vector<uint8_t> result;
+    if (fetch && (fetch->status == 200 || fetch->status == 206) &&
+        fetch->data && fetch->numBytes > 0) {
+        result.assign(fetch->data, fetch->data + fetch->numBytes);
+    }
+    if (fetch) emscripten_fetch_close(fetch);
     return result;
 }
 

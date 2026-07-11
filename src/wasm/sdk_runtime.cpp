@@ -719,12 +719,10 @@ bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device) {
   return true;
 }
 Entry* VirtualFileSystem::ResolvePath(std::string_view path) {
-  std::fprintf(stderr, "[vfs] ResolvePath '%.*s' (%zu dev)\n", (int)path.size(), path.data(), devices_.size());
   for (auto& dev : devices_) {
     Entry* e = dev->ResolvePath(path);
-    if (e) { std::fprintf(stderr, "[vfs]   OK\n"); return e; }
+    if (e) return e;
   }
-  std::fprintf(stderr, "[vfs]   NOT FOUND\n");
   return nullptr;
 }
 bool VirtualFileSystem::RegisterSymbolicLink(std::string_view path,
