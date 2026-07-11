@@ -76,6 +76,7 @@ target_link_libraries(nhllegacy PRIVATE nhllegacy_recomp)
 target_link_options(nhllegacy PRIVATE
   -O1
   -g0
+  -sFETCH
   -sWASM_BIGINT
   -sALLOW_MEMORY_GROWTH=1
   -sMAXIMUM_MEMORY=4294967296
