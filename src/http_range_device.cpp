@@ -409,7 +409,12 @@ bool HttpRangeDevice::Initialize() {
         if (parent) {
             parent->AddChild(std::move(entry));
         } else {
-            root_ = std::move(entry);
+            // Top-level file — attach to root directory
+            if (!root_) {
+                root_ = std::make_unique<HttpRangeEntry>(this, nullptr, "",
+                                                          /*is_dir=*/true, 0, nullptr);
+            }
+            static_cast<HttpRangeEntry*>(root_.get())->AddChild(std::move(entry));
         }
     }
 

@@ -43,6 +43,7 @@
 #include <rex/system/xmemory.h>
 #include <rex/system/xnotifylistener.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/xthread.h>
 #include <rex/runtime.h>
 #include "vfs_bridge.h"
 #include "http_range_device.h"
@@ -176,31 +177,9 @@ class WamFunctionDispatcher {
 // ============================================================================
 // ResolveIndirectFunction — the hook the generated recomp calls on cache miss.
 // ============================================================================
-
-namespace rex::runtime {
-
-static void __wasm_trap_handler(PPCContext& ctx, uint8_t* base) {
-  (void)base;
-  static std::atomic<unsigned> _cnt{0};
-  auto n = _cnt.fetch_add(1, std::memory_order_relaxed);
-  if (n < 5) std::fprintf(stderr, "[sdk] TRAP (#%u) → 0 (skip)\n", n + 1);
-  ctx.r3.u64 = 0u;  // return 0 = success/null — skips loops
-}
-
-PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
-  auto* d = WamFunctionDispatcher::instance();
-  if (!d) return &__wasm_trap_handler;
-  PPCFunc* f = d->Get(guest_address);
-  if (!f) {
-    static std::atomic<unsigned> _cnt{0};
-    auto n = _cnt.fetch_add(1, std::memory_order_relaxed);
-    if (n < 3) std::fprintf(stderr, "[sdk] unresolved indirect: 0x%08X (#%u)\n", guest_address, n + 1);
-    return &__wasm_trap_handler;
-  }
-  return f;
-}
-
-}  // namespace rex::runtime
+// Note: ResolveIndirectFunction is now provided by the SDK's
+// function_dispatcher.cpp. It uses Runtime::instance()->function_dispatcher().
+// ============================================================================
 
 // ============================================================================
 // SDK stubs — only symbols NOT provided inline by SDK headers.
@@ -396,9 +375,31 @@ UserProfile::UserProfile() = default;
 
 // ---- FunctionDispatcher stub ------------------------------------------------
 // We provide FunctionDispatcher outside the SDK's function_dispatcher.cpp
-// to avoid a duplicate ResolveIndirectFunction symbol.
+// ============================================================================
+// FunctionDispatcher stubs + ResolveIndirectFunction (our version)
+// ============================================================================
 
 namespace rex::runtime {
+
+static void __wasm_trap_handler(PPCContext& ctx, uint8_t* base) {
+  (void)base;
+  static std::atomic<unsigned> _cnt{0};
+  auto n = _cnt.fetch_add(1, std::memory_order_relaxed);
+  if (n < 5) std::fprintf(stderr, "[sdk] TRAP (#%u) → 0 (skip)\n", n + 1);
+  ctx.r3.u64 = 0u;
+}
+
+PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
+  auto* d = WamFunctionDispatcher::instance();
+  if (d) {
+    PPCFunc* f = d->Get(guest_address);
+    if (f) return f;
+  }
+  static std::atomic<unsigned> _cnt{0};
+  auto n = _cnt.fetch_add(1, std::memory_order_relaxed);
+  if (n < 3) std::fprintf(stderr, "[sdk] unresolved indirect: 0x%08X (#%u)\n", guest_address, n + 1);
+  return &__wasm_trap_handler;
+}
 
 FunctionDispatcher::FunctionDispatcher(memory::Memory* memory, ExportResolver* export_resolver)
     : memory_(memory), export_resolver_(export_resolver) {}
@@ -461,6 +462,10 @@ FunctionDispatcher::ModuleTableInfo* FunctionDispatcher::FindModuleByAddress(uin
 }
 
 }  // namespace rex::runtime
+
+// ============================================================================
+// SDK Memory stubs — WASM-compatible replacements for mmap-backed Memory.
+// ============================================================================
 
 static std::unordered_map<uint32_t, PPCFunc*> g_wasm_func_map;
 
@@ -658,6 +663,13 @@ namespace rex::string {
 
 bool utf8_equal_case(std::string_view a, std::string_view b) { return a == b; }
 
+std::string utf8_find_base_name_from_path(std::string_view path, char32_t) {
+  auto pos = path.rfind('\\');
+  if (pos == std::string_view::npos) pos = path.rfind('/');
+  if (pos != std::string_view::npos) return std::string(path.substr(pos + 1));
+  return std::string(path);
+}
+
 }  // namespace rex::string
 
 namespace rex::kernel::xboxkrnl {
@@ -685,12 +697,34 @@ Entry::Entry(Device* device, Entry* parent, const std::string_view path)
     name_ = std::string(path);
 }
 Entry::~Entry() = default;
-Entry* Entry::ResolvePath(const std::string_view path) { return nullptr; }
+Entry* Entry::ResolvePath(const std::string_view path) {
+  if (path.empty()) return this;
+  // Split on first separator
+  auto sep = path.find_first_of("\\/");
+  std::string_view component = (sep == std::string_view::npos) ? path : path.substr(0, sep);
+  std::string_view rest = (sep == std::string_view::npos) ? std::string_view() : path.substr(sep + 1);
+  for (auto& child : children_) {
+    if (child->name() == component) {
+      if (rest.empty()) return child.get();
+      return child->ResolvePath(rest);
+    }
+  }
+  return nullptr;
+}
 
 VirtualFileSystem::VirtualFileSystem() = default;
 VirtualFileSystem::~VirtualFileSystem() = default;
-bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device) { return true; }
-Entry* VirtualFileSystem::ResolvePath(std::string_view path) { return nullptr; }
+bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device) {
+  devices_.push_back(std::move(device));
+  return true;
+}
+Entry* VirtualFileSystem::ResolvePath(std::string_view path) {
+  for (auto& dev : devices_) {
+    Entry* e = dev->ResolvePath(path);
+    if (e) return e;
+  }
+  return nullptr;
+}
 bool VirtualFileSystem::RegisterSymbolicLink(std::string_view path,
                                               std::string_view target) { return true; }
 
@@ -729,11 +763,10 @@ static nhllegacy::HttpRangeDevice* g_wasm_vfs_device = nullptr;
 static rex::filesystem::File* g_wasm_file_table[kWasmMaxFileHandles] = {};
 static bool g_wasm_vfs_initialized = false;
 
-bool InitWasmVfs() {
+bool InitWasmVfs(rex::filesystem::VirtualFileSystem* vfs) {
   if (g_wasm_vfs_initialized) return true;
 
-  // Load manifest — prefer embedded test manifest (works everywhere),
-  // fall back to server fetch in browser.
+  // Load manifest
   nhllegacy::Manifest manifest;
   if (!nhllegacy::HttpRangeDevice::LoadManifestFromString(kTestManifest, manifest)) {
     if (!nhllegacy::HttpRangeDevice::LoadManifestFromUrl("/data/nhllegacy.manifest.json",
@@ -745,12 +778,22 @@ bool InitWasmVfs() {
   }
 
   size_t manifest_count = manifest.size();
-  g_wasm_vfs_device = new nhllegacy::HttpRangeDevice(
-      "\\CACHE", "/data/nhllegacy.bundle", std::move(manifest), "/opfs/cache");
+  auto device = std::make_unique<nhllegacy::HttpRangeDevice>(
+      "\\\\Device\\\\Harddisk0\\\\Partition1", "/data/nhllegacy.bundle",
+      nhllegacy::Manifest(manifest), "/opfs/cache");
 
-  if (!g_wasm_vfs_device->Initialize()) {
+  if (!device->Initialize()) {
     std::fprintf(stderr, "[vfs] ERROR: HttpRangeDevice init failed\n");
     return false;
+  }
+
+  // Store raw pointer for WasmOpenFile fallback
+  g_wasm_vfs_device = device.get();
+
+  // Register in SDK VirtualFileSystem for LoadXexImage / UserModule
+  if (vfs) {
+    vfs->RegisterDevice(std::move(device));
+    g_wasm_vfs_device = nullptr; // VFS owns it now
   }
 
   g_wasm_vfs_initialized = true;
@@ -761,7 +804,7 @@ bool InitWasmVfs() {
 
 #else  // !__EMSCRIPTEN__
 
-bool InitWasmVfs() {
+bool InitWasmVfs(rex::filesystem::VirtualFileSystem*) {
   // Node.js test: no real assets
   return false;
 }
@@ -867,9 +910,6 @@ extern "C" int wasm_boot_guest() {
   wasm_guest_base();
   uint8_t* base = g_guest_base;
 
-  // Initialize the VFS bridge (manifest + HttpRangeDevice)
-  InitWasmVfs();
-
   // Create the WASM function dispatcher and populate all 129,934 functions
   auto* disp = new WamFunctionDispatcher();
   WamFunctionDispatcher::set_instance(disp);
@@ -879,9 +919,7 @@ extern "C" int wasm_boot_guest() {
   }
 
   // Initialize SDK Runtime. This creates Memory, ExportResolver,
-  // FunctionDispatcher, and KernelState, sets Runtime::instance_,
-  // and runs the SDK's SetFunction loop to populate its own
-  // function_table_ (in addition to our WamFunctionDispatcher tables).
+  // FunctionDispatcher, KernelState, and VirtualFileSystem
   static rex::Runtime s_runtime("", "", "", "");
   rex::X_STATUS status = s_runtime.Setup(PPCImageConfig);
   if (status == 0) {
@@ -890,6 +928,9 @@ extern "C" int wasm_boot_guest() {
     std::fprintf(stderr, "[sdk] WASM Runtime setup returned 0x%08X\n",
                  static_cast<uint32_t>(status));
   }
+
+  // Initialize VFS: load manifest, register HttpRangeDevice in SDK's VFS
+  InitWasmVfs(s_runtime.file_system());
   WamFunctionDispatcher::set_instance(disp);
 
   if (!disp->InitFromImage(PPCImageConfig)) {
@@ -984,160 +1025,22 @@ extern "C" int wasm_boot_guest() {
                  (unsigned long long)tctx.r3.u64);
   }
 
-  // Continue boot chain: call more functions that might trigger additional kernel calls
-  static const uint32_t boot_chain[] = {
-    0x83067690,  // KeDelayExecutionThread caller
-    0x8306B6A0,  // ExCreateThread caller
-    0x8306EFE0,  // Another ExCreateThread caller
-    0x8306AEE8,  // RtlInitAnsiString/NtOpenFile
-    0x8306AFF8,  // RtlTimeFieldsToTime
-    0x83067760,  // NtOpenFile caller
-    0x830691B8,  // NtOpenFile caller
-    0x8306A078,  // NtOpenFile caller
-    0x830ABBF8,  // XAudio function
-    0x830ABD00,  // XAudio function
-    0x830AC028,  // XAudio function
-    0x827FE0F8,  // MmAllocatePhysicalMemoryEx caller
-    0x836FB1E8,  // RtlImageXexHeaderField caller
-    0x83069640,  // MmAllocatePhysicalMemoryEx caller
-    // 0x83095C48,  // XMA context creation loop — SKIP: infinite even after XMACreateContext fix
-    0x836EF540,  // TU 160 function
-    // 0x836EF5A8,  // TU 160 function — SKIP (OOB crash)
-    0x836EF650,  // TU 160 function
-    0x8370AD68,  // TU 160 function
-    0x8370B1C0,  // TU 160 function
-    0x8370B458,  // TU 160 function
-    0x83708828,  // TU 160 function
-    0x8370A7F8,  // TU 160 function
-    0x8370A9C0,  // TU 160 function
-    0x8370AAA0,  // TU 160 function
-    0x8370AB20,  // TU 160 function
-    0x8370ABD8,  // TU 160 function
-    0x83706518,  // TU 160 function
-    0x83706588,  // TU 160 function
-    0x837065F8,  // TU 160 function
-    0x83706668,  // TU 160 function
-    0x837066D8,  // TU 160 function
-    0x83703768,  // TU 160 function
-    0x837037E0,  // TU 160 function
-    0x837037F4,  // TU 160 function
-    0x837037F8,  // TU 160 function
-    // 0x83703870,  // TU 160 function — SKIP (stack overflow)
-    0x836FF6A0,  // TU 160 function
-    0x836FF710,  // TU 160 function
-    0x836FF9C0,  // TU 160 function
-    0x836FFA20,  // TU 160 function
-    0x836FFA90,  // TU 160 function
-    0x836FC8E0,  // TU 160 function
-    0x836FC8F8,  // TU 160 function
-    0x836FC910,  // TU 160 function
-    0x836FC928,  // TU 160 function
-    0x836FCA50,  // TU 160 function
-    0x836FB2E8,  // TU 160 function
-    0x836FB370,  // TU 160 function
-    0x836FB4B8,  // TU 160 function
-    0x836FB5D0,  // TU 160 function
-    0x836FB6A0,  // TU 160 function
-    0x836FA100,  // TU 160 function
-    0x836FA178,  // TU 160 function
-    0x836FA188,  // TU 160 function
-    0x836FA200,  // TU 160 function
-    0x836FA210,  // TU 160 function
-    0x836FA278,  // TU 160 function
-    0x836F8DD8,  // TU 160 function
-    0x836F8FE0,  // TU 160 function
-    0x836F9020,  // TU 160 function
-    0x836F9070,  // TU 160 function
-    0x836F90F8,  // TU 160 function
-    0x836F5B40,  // TU 160 function
-    0x836F5BE8,  // TU 160 function
-    0x836F5CB0,  // TU 160 function
-    0x836F6228,  // TU 160 function
-    0x836F65A0,  // TU 160 function
-    0x836F39B8,  // TU 160 function
-    0x836F3A60,  // TU 160 function
-    0x836F3B48,  // TU 160 function
-    0x836F3C38,  // TU 160 function
-    0x836F3CD8,  // TU 160 function
-    0x836F3D78,  // TU 160 function
-    0x836F3D90,  // TU 160 function
-    0x836F3E80,  // TU 160 function
-    0x836F3E98,  // TU 160 function
-    0x836F3F38,  // TU 160 function
-    0x836F0BA0,  // TU 160 function
-    0x836F0BE8,  // TU 160 function
-    0x836F0C30,  // TU 160 function
-    0x836F0CF0,  // TU 160 function
-    0x836F0DF8,  // TU 160 function
-    0x836F0E68,  // TU 160 function
-    0x836F0F18,  // TU 160 function
-    0x836F0FE0,  // TU 160 function
-    0x836F1060,  // TU 160 function
-    0x836EF548,  // TU 160 function
-    0x836EF5F8,  // TU 160 function
-    0x836EF658,  // TU 160 function
-    0x836EF6B8,  // TU 160 function
-    0x836EF708,  // TU 160 function
-    0x836EF778,  // TU 160 function
-    0x836EF780,  // TU 160 function
-    0x836EF788,  // TU 160 function
-    0x836EF7E8,  // TU 160 function
-    0x836EF838,  // TU 160 function
-    0, };
-  for (auto* p = boot_chain; *p; ++p) {
-    auto* f = disp->Get(*p);
-    if (!f) continue;
-    PPCContext pctx{};
-    std::memset(&pctx, 0, sizeof(pctx));
-    pctx.r3.u64 = kMod;
-    pctx.r1.u64 = 0x40000000ull;
-    pctx.r13.u64 = 0x10000000ull;
-    pctx.fpscr.InitHost();
-    std::fprintf(stderr, "[sdk] calling 0x%08X...\n", *p);
-    auto start = std::chrono::steady_clock::now();
-    f(pctx, base);
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start).count();
-    std::fprintf(stderr, "[sdk] 0x%08X → r3=0x%llX (%lld ms)\n",
-                 *p, (unsigned long long)pctx.r3.u64, (long long)elapsed);
-    if (elapsed > 15000) {
-      std::fprintf(stderr, "[sdk] TIMEOUT — skipping rest\n");
-      break;
+  // Load the game XEX — populates module data, import table, entry point
+  rex::X_STATUS load_status = s_runtime.LoadXexImage("default.xex");
+  if (load_status != 0) {
+    std::fprintf(stderr, "[sdk] LoadXexImage(default.xex) returned 0x%08X\n",
+                 static_cast<uint32_t>(load_status));
+  } else {
+    std::fprintf(stderr, "[sdk] XEX image loaded, preparing launch...\n");
+    auto thread = s_runtime.PrepareModuleLaunch();
+    if (!thread) {
+      std::fprintf(stderr, "[sdk] PrepareModuleLaunch failed\n");
+    } else {
+      std::fprintf(stderr, "[sdk] launching game thread...\n");
+      thread->Resume();
+      std::fprintf(stderr, "[sdk] game thread launched\n");
     }
   }
-
-  // Render a test frame: copy guest framebuffer → 2D canvas via EM_ASM
-  {
-    uint32_t fb_ptr = 0x3FE00000;
-    uint32_t w = 1280, h = 720;
-    uint8_t* fb_base = base + fb_ptr;
-
-    // Paint a test pattern
-    for (uint32_t y = 0; y < h; ++y) {
-      for (uint32_t x = 0; x < w; ++x) {
-        uint8_t r, g, b;
-        if (y < 60) { r = 0x22; g = 0x44; b = 0xAA; }         /* blue header */
-        else if (y < 64) { r = 0xFF; g = 0xFF; b = 0xFF; }      /* white line */
-        else if (y < 100) { r = 0xFF; g = 0x00; b = 0x00; }     /* red band */
-        else if (y < 140) { r = 0x00; g = 0xFF; b = 0x00; }     /* green band */
-        else { r = (uint8_t)((x * 255u) / w); g = (uint8_t)((y * 255u) / h); b = 0x80; } /* gradient */
-        size_t off = (size_t)y * (size_t)w * 4u + (size_t)x * 4u;
-        fb_base[off + 0] = b; fb_base[off + 1] = g; fb_base[off + 2] = r; fb_base[off + 3] = 0xFF;
-      }
-    }
-    char js[2048];
-    uint32_t fb_wasm_off = (uint32_t)(uintptr_t)fb_base;
-    snprintf(js, sizeof(js),
-      "setTimeout(function(){"
-      "var p=%u,w=%u,h=%u,ctx=Module.canvas2d;"
-      "if(ctx){var a=new Uint8ClampedArray(HEAPU8.buffer,p,w*h*4);"
-      "for(var i=0;i<a.length;i+=4){var b=a[i],r=a[i+2];a[i]=r;a[i+2]=b;}"
-      "var img=new ImageData(a,w,h);ctx.putImageData(img,0,0);}"
-      "},500);",
-      fb_wasm_off, w, h);
-    emscripten_run_script(js);
-  }
-  std::fprintf(stderr, "[sdk] test frame displayed on canvas\n");
 
   return 0;
 }

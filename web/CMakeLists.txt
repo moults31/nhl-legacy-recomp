@@ -59,6 +59,7 @@ set(WASM_SOURCES
   ${SDK_SYSTEM_SRC}/xfile.cpp
   ${SDK_SYSTEM_SRC}/xthread.cpp
   ${SDK_SYSTEM_SRC}/runtime.cpp
+  ${SDK_SYSTEM_SRC}/user_module.cpp
 )
 
 add_executable(nhllegacy ${WASM_SOURCES})
