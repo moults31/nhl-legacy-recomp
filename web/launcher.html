@@ -81,14 +81,14 @@
           log('[wasm] Compiling...', 'info');
           WebAssembly.instantiate(new Uint8Array(xhr.response), info)
              .then(function(result) {
+              loadingEl.style.display = 'none';
+              initCanvas(Module.canvas);
               statusEl.textContent = 'Instantiating WASM...';
               log('[wasm] Instantiating...', 'info');
               log('[wasm] Running main()...', 'info');
               receiveInstance(result.instance, result.module);
               log('[wasm] main() returned', 'info');
-              statusEl.textContent = 'WASM instantiated — main() finished';
-              // GPU init on macrotask (event loop available, not inside microtask)
-              setTimeout(function() { initCanvas(Module.canvas); }, 0);
+              statusEl.textContent = 'WASM instantiated';
             })
             .catch(function(err) {
               var msg = err.message || String(err);
