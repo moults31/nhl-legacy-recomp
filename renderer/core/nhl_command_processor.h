@@ -189,6 +189,26 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   // Renders (or, in bring-up, clears) the owned draw into our offscreen RT.
   void RenderBetaOwnedDraw(rex::graphics::xenos::PrimitiveType primitive_type, uint32_t index_count,
                            rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info);
+  // MT producer (NHL_HIGHCUT_MT_PRODUCER, docs/mt-producer-stage1-plan.md): the per-draw packet
+  // production (geometry gather → untile → serialize → push), lifted out of RenderBetaOwnedDraw so it
+  // can run on a worker. Reads per-draw inputs from a HcDrawTask snapshot (register banks + guest
+  // vtx/idx bytes the SDK rewrites between draws) instead of live state; `use_snapshot=false` reads live
+  // register_file_/memory_ so the SERIAL path (default, flag off) is byte-identical and self-verifying.
+  // Defined in the .cpp (heavy SDK types); forward-declared here as a nested type.
+  struct HcDrawTask;
+  void ProduceLiveDrawPacket(HcDrawTask& t);
+  // MT producer frame commit, run IN PIPELINE ORDER (worker thread when threaded, CP thread when sync) at
+  // a frame-boundary marker: finalize the just-ended frame's resolve sidecar to the plume bridge + reset
+  // the per-frame draw index + emit the fps readout. Boundary detection + resolve serialization happen on
+  // the CP thread (owner of highcut_resolves_) and are passed in as resolve_bytes.
+  void CommitLiveFrameOnWorker(const std::vector<uint8_t>& resolve_bytes);
+  // MT producer worker (1b-step2): a single background thread runs ProduceLiveDrawPacket on snapshotted
+  // tasks so our ~34ms per-draw work overlaps the CP thread's ~25ms SDK PM4 decode. Lazily created on the
+  // first MT draw; deleted (stop + join) in ShutdownContext, with the out-of-line destructor as backstop.
+  // RAW owning pointer on purpose: a unique_ptr<incomplete HcLiveWorker> would force every TU that
+  // constructs this class (graphics_system's make_unique via the inherited ctor) to complete the type.
+  struct HcLiveWorker;
+  HcLiveWorker* mt_worker_ = nullptr;
   // Loose-asset texture injection (replay only): some textures are never written
   // by the GPU trace (static assets cached before capture), so guest RAM is zero
   // at their fetch-constant base and they render black. NHL_BETA_INJECT supplies

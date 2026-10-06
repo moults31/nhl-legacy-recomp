@@ -846,6 +846,13 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     const uint8_t* fetch = take(hdr.fetch_bytes);
     const uint8_t* sysc = take(hdr.sys_bytes);
     const uint8_t* shared = take(hdr.shared_bytes);
+    // v12 by-id geometry: when the vertex bytes were streamed (shared_bytes==0, vtx_id!=0), resolve them
+    // from the dictionary. `sharedN` is the effective vertex byte count from here on.
+    uint32_t sharedN = hdr.shared_bytes;
+    if (hdr.shared_bytes == 0 && hdr.vtx_id) {
+        auto r = c.resourceBytes.find(hdr.vtx_id);
+        if (r != c.resourceBytes.end()) { shared = r->second.data(); sharedN = uint32_t(r->second.size()); }
+    }
     const uint8_t* boolc = take(hdr.bool_bytes);
     const uint8_t* vsf = take(hdr.vs_float_bytes);
     const uint8_t* psf = take(hdr.ps_float_bytes);
@@ -889,6 +896,12 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     // C-5d: kGuestDMA index blob (raw guest indices, last in the packet).
     const uint8_t* idxData = hdr.index_bytes ? take(hdr.index_bytes) : nullptr;
     if (hdr.index_bytes && !idxData) return false;
+    // v12 by-id geometry: resolve streamed indices from the dictionary. `idxN` = effective index bytes.
+    uint32_t idxN = hdr.index_bytes;
+    if (hdr.index_bytes == 0 && hdr.idx_id) {
+        auto r = c.resourceBytes.find(hdr.idx_id);
+        if (r != c.resourceBytes.end()) { idxData = r->second.data(); idxN = uint32_t(r->second.size()); }
+    }
 
     // by-ID: reuse the compiled shader module across draws/frames (keyed by the producer's shader id).
     // On a miss we compile the inline SPIR-V (Step 1 still ships bytes every draw; Step 2 ships once).
@@ -954,7 +967,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     // capture cap). Floor only 4K (was 64K): a dense frame creates one of these per draw, so a 64K floor
     // over-allocated thousands of small draws to 64K each — wasted alloc time + memory at 4000+ draws.
     const uint64_t kShared = std::min<uint64_t>(
-        std::max<uint64_t>(hdr.shared_bytes, 1u << 12), 16u * 0x100000u);
+        std::max<uint64_t>(sharedN, 1u << 12), 16u * 0x100000u);
     auto mkUbo = [&](uint64_t sz, const uint8_t* src, uint32_t srcN) {
         auto b = c.device->createBuffer(RenderBufferDesc::UploadBuffer(sz, RenderBufferFlag::CONSTANT));
         if (b) {
@@ -974,7 +987,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     if (d.sharedBuf) {
         void* p = d.sharedBuf->map();
         std::memset(p, 0, kShared);
-        if (shared && hdr.shared_bytes) std::memcpy(p, shared, std::min<uint64_t>(hdr.shared_bytes, kShared));
+        if (shared && sharedN) std::memcpy(p, shared, std::min<uint64_t>(sharedN, kShared));
         d.sharedBuf->unmap();
     }
     if (!d.sysBuf || !d.boolBuf || !d.fetchBuf || !d.vsFloatBuf || !d.psFloatBuf || !d.sharedBuf)
@@ -1228,13 +1241,13 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
             if (d.indexBuf) { void* p = d.indexBuf->map(); std::memcpy(p, idx.data(), bytes); d.indexBuf->unmap(); }
             if (d.indexBuf) { d.indexCount = uint32_t(idx.size()); d.indexU32 = true; }
         }
-    } else if (hdr.index_format != 0 && idxData && hdr.index_bytes) {
+    } else if (hdr.index_format != 0 && idxData && idxN) {
         // C-5d: kGuestDMA indexed draw — upload the raw guest indices verbatim (the VS swaps
         // gl_VertexIndex via vertex_index_endian, so no host byte-swap), then drawIndexedInstanced.
-        // vertex_count carries the INDEX count for these draws.
+        // vertex_count carries the INDEX count for these draws. (idxN = inline or by-id streamed size.)
         d.indexBuf = c.device->createBuffer(
-            RenderBufferDesc::IndexBuffer(hdr.index_bytes, RenderHeapType::UPLOAD));
-        if (d.indexBuf) { void* p = d.indexBuf->map(); std::memcpy(p, idxData, hdr.index_bytes); d.indexBuf->unmap(); }
+            RenderBufferDesc::IndexBuffer(idxN, RenderHeapType::UPLOAD));
+        if (d.indexBuf) { void* p = d.indexBuf->map(); std::memcpy(p, idxData, idxN); d.indexBuf->unmap(); }
         if (d.indexBuf) { d.indexCount = hdr.vertex_count; d.indexU32 = (hdr.index_format == 2); }
     }
     RenderGraphicsPipelineDesc pd;
@@ -1567,6 +1580,15 @@ void LoadResolveGraph(PlumeCtx& c) {
 }
 
 void RenderClear(PlumeCtx& c) {
+    // F-6 PERF SPIKE: NHL_HIGHCUT_PERF measures plume's per-frame cost in isolation, to answer
+    // "can owned-plume hit real-time?" CPU-record = begin()->end() (building the command buffer);
+    // GPU = executeCommandLists->waitForCommandFence (the fence is signaled by command-list
+    // completion, independent of present/vsync, which only stalls the NEXT acquire). These are
+    // serial in this single-frame-in-flight design, so frame = record + gpu. Logged every 60 frames.
+    static const bool perf = std::getenv("NHL_HIGHCUT_PERF") != nullptr;
+    static double s_perfRec = 0.0, s_perfGpu = 0.0, s_perfRecMax = 0.0, s_perfGpuMax = 0.0;
+    static uint64_t s_perfN = 0;
+    std::chrono::steady_clock::time_point tRec0{}, tRecEnd{}, tGpu0{};
     // C-5a: load the captured frame once, before touching the swapchain (resource creation +
     // texture uploads use the queue, independent of the frame). Gated NHL_HIGHCUT_C5.
     static const bool c5_mode = std::getenv("NHL_HIGHCUT_C5") != nullptr;
@@ -1578,6 +1600,7 @@ void RenderClear(PlumeCtx& c) {
     if (c5_mode && live_feed) {
         const uint64_t seq = g_liveSeq.load(std::memory_order_acquire);
         if (seq != c.liveSeqSeen) {
+            REXLOG_INFO("[F3-bridge] consumer: new live seq {} (was {}) — rebuilding", seq, c.liveSeqSeen);
             // Step 2: drain the resource dictionary FIRST (append-only, never dropped), so every shader/
             // texture id a draw references is in c.resourceBytes before the rebuild looks it up.
             {
@@ -1599,6 +1622,7 @@ void RenderClear(PlumeCtx& c) {
         return;
     }
 
+    if (perf) tRec0 = std::chrono::steady_clock::now();
     c.cmd->begin();
     RenderTexture* tex = c.swap->getTexture(idx);
     // C-5c: transition color -> COLOR_WRITE and the shared depth-stencil -> DEPTH_WRITE for this pass.
@@ -2101,6 +2125,7 @@ void RenderClear(PlumeCtx& c) {
     c.cmd->barriers(RenderBarrierStage::NONE,
                     RenderTextureBarrier(tex, RenderTextureLayout::PRESENT));
     c.cmd->end();
+    if (perf) tRecEnd = std::chrono::steady_clock::now();
 
     while (c.releaseSems.size() < c.swap->getTextureCount())
         c.releaseSems.emplace_back(c.device->createCommandSemaphore());
@@ -2108,9 +2133,28 @@ void RenderClear(PlumeCtx& c) {
     const RenderCommandList* cl = c.cmd.get();
     RenderCommandSemaphore* wait = c.acquireSem.get();
     RenderCommandSemaphore* signal = c.releaseSems[idx].get();
+    if (perf) tGpu0 = std::chrono::steady_clock::now();
     c.queue->executeCommandLists(&cl, 1, &wait, 1, &signal, 1, c.fence.get());
     c.swap->present(idx, &signal, 1);
     c.queue->waitForCommandFence(c.fence.get());
+    if (perf) {
+        using msd = std::chrono::duration<double, std::milli>;
+        const auto now = std::chrono::steady_clock::now();
+        const double recMs = std::chrono::duration_cast<msd>(tRecEnd - tRec0).count();
+        const double gpuMs = std::chrono::duration_cast<msd>(now - tGpu0).count();
+        s_perfRec += recMs; s_perfGpu += gpuMs; ++s_perfN;
+        if (recMs > s_perfRecMax) s_perfRecMax = recMs;
+        if (gpuMs > s_perfGpuMax) s_perfGpuMax = gpuMs;
+        if (s_perfN >= 60) {
+            const double aRec = s_perfRec / double(s_perfN), aGpu = s_perfGpu / double(s_perfN);
+            const double total = aRec + aGpu;
+            REXLOG_INFO("[highcut-PERF] draws={} | CPU-record avg={:.3f}ms max={:.3f} | "
+                        "GPU avg={:.3f}ms max={:.3f} | frame={:.3f}ms -> {:.1f} fps ceiling",
+                        uint32_t(c.c5draws.size()), aRec, s_perfRecMax, aGpu, s_perfGpuMax,
+                        total, total > 0.0 ? 1000.0 / total : 0.0);
+            s_perfRec = s_perfGpu = 0.0; s_perfN = 0; s_perfRecMax = s_perfGpuMax = 0.0;
+        }
+    }
 
     // C-5g: GPU is idle (fence waited) — map the readback buffer and write the PNG once.
     if (doShot && shotBuf) {
@@ -2209,9 +2253,15 @@ extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size) {
 
 // C-6 live feed: CP thread appends one owned draw's packet bytes to the in-progress frame. No lock —
 // only the CP thread touches g_liveBuild between commits.
-extern "C" void HighcutLivePushDraw(const uint8_t* data, size_t size) {
-    if (!g_enabled || !data || !size) return;
-    g_liveBuild.emplace_back(data, data + size);
+// F3-bridge: total pushes, so a silent commit log can show whether draws ever reached the bridge.
+uint64_t g_livePushTotal = 0;
+// F-3.3: take the packet by MOVE so the CP's built vector is moved into the frame, not deep-copied
+// (the by-value bridge copy was the bulk of the "packet" producer cost). Kept extern "C" so the two
+// TUs link by the unmangled symbol name (a C++-typed param under extern "C" is legal — [dcl.link]).
+extern "C" void HighcutLivePushDraw(std::vector<uint8_t>&& pkt) {
+    if (!g_enabled || pkt.empty()) return;
+    g_liveBuild.push_back(std::move(pkt));
+    ++g_livePushTotal;
 }
 // Step 2: CP thread streams a unique shader/texture's bytes ONCE (append-only, persistent). The plume
 // thread drains g_resourcePending into c.resourceBytes before each rebuild.
@@ -2224,6 +2274,18 @@ extern "C" void HighcutLivePushResource(uint64_t id, const uint8_t* data, size_t
 // g_livePending under the lock and bump the seq so the plume thread picks it up. resolves may be null.
 extern "C" void HighcutLiveCommitFrame(const uint8_t* resolves, size_t rsize) {
     if (!g_enabled) { g_liveBuild.clear(); g_liveBuildResolves.clear(); return; }
+    // F3-bridge observability: log the commit chain (before the empty-skip) so a silent break is
+    // visible — "no commit lines" = CP never reaches commit; "0 draws" = pushes not firing; "N draws,
+    // seq=S" = bridge fine, look at the consumer. Push+commit are CP-thread-only (no lock needed here).
+    {
+        static uint64_t s_commits = 0, s_empty = 0;
+        const size_t built = g_liveBuild.size();
+        if (built == 0) ++s_empty;
+        if (s_commits < 4 || (s_commits % 120) == 0)
+            REXLOG_INFO("[F3-bridge] commit #{}: {} draws this frame, {} pushes total, {} empty, seq->{}",
+                        s_commits, built, g_livePushTotal, s_empty, g_liveSeq.load() + (built ? 1 : 0));
+        ++s_commits;
+    }
     if (g_liveBuild.empty()) return;  // nothing accumulated (e.g. a non-rendered frame)
     {
         std::lock_guard<std::mutex> lk(g_liveMutex);
